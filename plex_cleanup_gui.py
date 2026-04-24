@@ -1037,15 +1037,28 @@ function showLog(data) {
   $("log").textContent = JSON.stringify(data, null, 2);
 }
 
+function formatElapsed(ms) {
+  const totalSeconds = Math.floor(ms / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+}
+
 async function scan() {
   await saveConfig();
   $("scanBtn").disabled = true;
-  $("scanStatus").textContent = "Scanning Plex...";
+  const startedAt = Date.now();
+  const updateScanTimer = () => {
+    $("scanStatus").textContent = `Scanning Plex... ${formatElapsed(Date.now() - startedAt)}`;
+  };
+  updateScanTimer();
+  const scanTimer = setInterval(updateScanTimer, 1000);
   try {
     state.scan = await api("/api/scan", { method: "POST", body: JSON.stringify(readConfig()) });
     renderScan();
-    $("scanStatus").textContent = `Scanned ${new Date(state.scan.generatedAt * 1000).toLocaleString()}`;
+    $("scanStatus").textContent = `Scanned ${new Date(state.scan.generatedAt * 1000).toLocaleString()} in ${formatElapsed(Date.now() - startedAt)}`;
   } finally {
+    clearInterval(scanTimer);
     $("scanBtn").disabled = false;
   }
 }
