@@ -8,14 +8,15 @@
   "radarr": {
     "url": "http://localhost:7878",
     "api_key": "",
-    "add_import_exclusion": false
+    "add_import_exclusion": true
   },
   "sonarr": {
     "url": "http://localhost:8989",
-    "api_key": ""
+    "api_key": "",
+    "add_import_list_exclusion": true
   },
   "scan": {
-    "inactive_days": 180,
+    "inactive_days": 365,
     "include_never_watched": true,
     "include_watched_before_cutoff": true
   }

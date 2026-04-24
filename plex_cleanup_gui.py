@@ -41,14 +41,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "radarr": {
         "url": "http://localhost:7878",
         "api_key": "",
-        "add_import_exclusion": False,
+        "add_import_exclusion": True,
     },
     "sonarr": {
         "url": "http://localhost:8989",
         "api_key": "",
+        "add_import_list_exclusion": True,
     },
     "scan": {
-        "inactive_days": 180,
+        "inactive_days": 365,
         "include_never_watched": True,
         "include_watched_before_cutoff": True,
     },
@@ -160,6 +161,10 @@ def arr_delete(service: Service, path: str, params: dict[str, Any] | None = None
     return request_json("DELETE", url, headers={"X-Api-Key": service.api_key})
 
 
+def arr_put(service: Service, path: str, body: Any) -> Any:
+    return request_json("PUT", service.endpoint(path), headers={"X-Api-Key": service.api_key}, body=body)
+
+
 def media_container(data: Any) -> dict[str, Any]:
     return data.get("MediaContainer", {}) if isinstance(data, dict) else {}
 
@@ -211,6 +216,14 @@ def item_size(item: dict[str, Any]) -> int:
     return total
 
 
+def item_has_file(item: dict[str, Any]) -> bool:
+    for media in item.get("Media", []) or []:
+        for part in media.get("Part", []) or []:
+            if part.get("file") or parse_size(part.get("size")) > 0:
+                return True
+    return False
+
+
 def human_size(size: int) -> str:
     units = ["B", "KB", "MB", "GB", "TB"]
     amount = float(size)
@@ -223,6 +236,11 @@ def human_size(size: int) -> str:
     return f"{size} B"
 
 
+def latest_timestamp(values: list[int | None]) -> int | None:
+    timestamps = [int(value) for value in values if value]
+    return max(timestamps) if timestamps else None
+
+
 def watched_state(item: dict[str, Any], cutoff: int) -> dict[str, Any]:
     view_count = int(item.get("viewCount") or 0)
     last_viewed = int(item.get("lastViewedAt") or 0)
@@ -233,40 +251,61 @@ def watched_state(item: dict[str, Any], cutoff: int) -> dict[str, Any]:
     return {"candidate": False, "reason": "Watched recently", "lastViewedAt": last_viewed}
 
 
-def find_library_key(config: dict[str, Any], wanted_type: str, configured_name: str) -> str | None:
+def plex_libraries(config: dict[str, Any]) -> list[dict[str, str]]:
     sections = directory_list(plex_get(config, "/library/sections"))
-    matching_type = [s for s in sections if s.get("type") == wanted_type]
-    if configured_name:
-        for section in matching_type:
-            if str(section.get("title", "")).lower() == configured_name.lower():
-                return str(section.get("key"))
-            if str(section.get("key", "")) == configured_name:
-                return str(section.get("key"))
-    return str(matching_type[0].get("key")) if matching_type else None
+    libraries = []
+    for section in sections:
+        section_type = str(section.get("type", ""))
+        if section_type not in ("movie", "show"):
+            continue
+        libraries.append(
+            {
+                "key": str(section.get("key", "")),
+                "title": str(section.get("title", "")),
+                "type": section_type,
+            }
+        )
+    return libraries
+
+
+def find_library_key(config: dict[str, Any], wanted_type: str, configured_name: str) -> str | None:
+    if not configured_name:
+        return None
+    matching_type = [s for s in plex_libraries(config) if s.get("type") == wanted_type]
+    for section in matching_type:
+        if str(section.get("title", "")).lower() == configured_name.lower():
+            return str(section.get("key"))
+        if str(section.get("key", "")) == configured_name:
+            return str(section.get("key"))
+    return None
 
 
 def get_movie_detail(config: dict[str, Any], rating_key: str) -> dict[str, Any]:
     return first_metadata(plex_get(config, f"/library/metadata/{rating_key}"))
 
 
-def get_show_seasons(config: dict[str, Any], rating_key: str, cutoff: int) -> list[dict[str, Any]]:
+def get_show_seasons(config: dict[str, Any], rating_key: str, cutoff: int) -> tuple[list[dict[str, Any]], int]:
     seasons = []
+    skipped_episodes = 0
     for season in metadata_list(plex_get(config, f"/library/metadata/{rating_key}/children")):
         if season.get("type") != "season":
             continue
         season_key = str(season.get("ratingKey"))
         episodes = []
         total_size = 0
-        candidate_episodes = 0
+        watched_episodes = 0
         for episode in metadata_list(plex_get(config, f"/library/metadata/{season_key}/children")):
             detail = first_metadata(plex_get(config, f"/library/metadata/{episode.get('ratingKey')}"))
             if not detail:
                 detail = episode
+            if not item_has_file(detail):
+                skipped_episodes += 1
+                continue
             state = watched_state(detail, cutoff)
             size = item_size(detail)
             total_size += size
-            if state["candidate"]:
-                candidate_episodes += 1
+            if state["lastViewedAt"]:
+                watched_episodes += 1
             episodes.append(
                 {
                     "ratingKey": str(detail.get("ratingKey") or episode.get("ratingKey")),
@@ -279,25 +318,31 @@ def get_show_seasons(config: dict[str, Any], rating_key: str, cutoff: int) -> li
                     "sizeText": human_size(size),
                 }
             )
-        is_candidate = bool(episodes) and candidate_episodes == len(episodes)
+        last_viewed_at = latest_timestamp([episode["lastViewedAt"] for episode in episodes])
+        is_candidate = bool(episodes) and (last_viewed_at is None or last_viewed_at < cutoff)
+        reason = "Never watched" if last_viewed_at is None else (
+            "Not watched recently" if is_candidate else "Watched recently"
+        )
         seasons.append(
             {
                 "ratingKey": season_key,
                 "title": season.get("title") or f"Season {season.get('index', '')}",
                 "seasonNumber": int(season.get("index") or 0),
                 "episodeCount": len(episodes),
-                "candidateEpisodeCount": candidate_episodes,
+                "watchedEpisodeCount": watched_episodes,
                 "candidate": is_candidate,
+                "reason": reason,
+                "lastViewedAt": last_viewed_at,
                 "size": total_size,
                 "sizeText": human_size(total_size),
                 "episodes": episodes,
             }
         )
-    return seasons
+    return seasons, skipped_episodes
 
 
 def scan_media(config: dict[str, Any]) -> dict[str, Any]:
-    inactive_days = int(config["scan"].get("inactive_days") or 180)
+    inactive_days = int(config["scan"].get("inactive_days") or 365)
     cutoff = int(time.time()) - inactive_days * 86400
     movie_key = find_library_key(config, "movie", config["plex"].get("movie_library", ""))
     show_key = find_library_key(config, "show", config["plex"].get("show_library", ""))
@@ -307,17 +352,21 @@ def scan_media(config: dict[str, Any]) -> dict[str, Any]:
         "movies": [],
         "shows": [],
         "warnings": [],
+        "skippedNoFile": {"movies": 0, "episodes": 0},
     }
     if not movie_key:
-        result["warnings"].append("No Plex movie library was found.")
+        result["warnings"].append("No Plex movie library selected.")
     if not show_key:
-        result["warnings"].append("No Plex TV library was found.")
+        result["warnings"].append("No Plex TV library selected.")
 
     if movie_key:
         for movie in metadata_list(plex_get(config, f"/library/sections/{movie_key}/all", {"type": 1})):
             detail = get_movie_detail(config, str(movie.get("ratingKey")))
             if not detail:
                 detail = movie
+            if not item_has_file(detail):
+                result["skippedNoFile"]["movies"] += 1
+                continue
             state = watched_state(detail, cutoff)
             if not state["candidate"]:
                 continue
@@ -341,13 +390,15 @@ def scan_media(config: dict[str, Any]) -> dict[str, Any]:
         for show in metadata_list(plex_get(config, f"/library/sections/{show_key}/all", {"type": 2})):
             detail = first_metadata(plex_get(config, f"/library/metadata/{show.get('ratingKey')}")) or show
             ids = extract_guid_ids(detail)
-            all_seasons = get_show_seasons(config, str(show.get("ratingKey")), cutoff)
+            all_seasons, skipped_episodes = get_show_seasons(config, str(show.get("ratingKey")), cutoff)
+            result["skippedNoFile"]["episodes"] += skipped_episodes
             candidate_seasons = [season for season in all_seasons if season["candidate"]]
             if not candidate_seasons:
                 continue
             total_size = sum(season["size"] for season in all_seasons)
             candidate_size = sum(season["size"] for season in candidate_seasons)
             can_delete_whole_show = bool(all_seasons) and len(candidate_seasons) == len(all_seasons)
+            last_viewed_at = latest_timestamp([season["lastViewedAt"] for season in all_seasons])
             result["shows"].append(
                 {
                     "kind": "show",
@@ -359,8 +410,9 @@ def scan_media(config: dict[str, Any]) -> dict[str, Any]:
                     "totalSize": total_size,
                     "totalSizeText": human_size(total_size),
                     "canDeleteWholeShow": can_delete_whole_show,
+                    "lastViewedAt": last_viewed_at,
                     "ids": ids,
-                    "seasons": candidate_seasons,
+                    "seasons": all_seasons,
                 }
             )
     return result
@@ -411,28 +463,92 @@ def match_sonarr_series(config: dict[str, Any], item: dict[str, Any]) -> dict[st
 def delete_movie(config: dict[str, Any], item: dict[str, Any]) -> dict[str, Any]:
     movie = match_radarr_movie(config, item)
     if not movie:
-        return {"ok": False, "title": item.get("title"), "error": "No Radarr match found"}
+        return {
+            "ok": False,
+            "kind": "movie",
+            "ratingKey": item.get("ratingKey"),
+            "title": item.get("title"),
+            "error": "No Radarr match found",
+        }
     params = {
         "deleteFiles": "true",
-        "addImportExclusion": "true" if config["radarr"].get("add_import_exclusion") else "false",
+        "addImportExclusion": "true",
     }
     arr_delete(radarr_service(config), f"/api/v3/movie/{movie['id']}", params)
-    return {"ok": True, "title": item.get("title"), "service": "radarr", "matchedTitle": movie.get("title")}
+    return {
+        "ok": True,
+        "kind": "movie",
+        "ratingKey": item.get("ratingKey"),
+        "title": item.get("title"),
+        "service": "radarr",
+        "matchedTitle": movie.get("title"),
+    }
 
 
 def delete_show(config: dict[str, Any], item: dict[str, Any]) -> dict[str, Any]:
     series = match_sonarr_series(config, item)
     if not series:
-        return {"ok": False, "title": item.get("title"), "error": "No Sonarr match found"}
-    arr_delete(sonarr_service(config), f"/api/v3/series/{series['id']}", {"deleteFiles": "true"})
-    return {"ok": True, "title": item.get("title"), "service": "sonarr", "matchedTitle": series.get("title")}
+        return {
+            "ok": False,
+            "kind": "show",
+            "ratingKey": item.get("ratingKey"),
+            "title": item.get("title"),
+            "error": "No Sonarr match found",
+        }
+    arr_delete(
+        sonarr_service(config),
+        f"/api/v3/series/{series['id']}",
+        {
+            "deleteFiles": "true",
+            "addImportListExclusion": "true",
+        },
+    )
+    return {
+        "ok": True,
+        "kind": "show",
+        "ratingKey": item.get("ratingKey"),
+        "deleteWholeShow": True,
+        "title": item.get("title"),
+        "service": "sonarr",
+        "matchedTitle": series.get("title"),
+    }
+
+
+def unmonitor_sonarr_seasons(service: Service, series: dict[str, Any], season_numbers: list[int]) -> int:
+    wanted = set(season_numbers)
+    changed = 0
+    for season in series.get("seasons", []) or []:
+        if season.get("seasonNumber") in wanted and season.get("monitored"):
+            season["monitored"] = False
+            changed += 1
+    if changed:
+        arr_put(service, f"/api/v3/series/{series['id']}", series)
+    return changed
 
 
 def delete_seasons(config: dict[str, Any], item: dict[str, Any], season_numbers: list[int]) -> dict[str, Any]:
     series = match_sonarr_series(config, item)
     if not series:
-        return {"ok": False, "title": item.get("title"), "error": "No Sonarr match found"}
+        return {
+            "ok": False,
+            "kind": "show",
+            "ratingKey": item.get("ratingKey"),
+            "title": item.get("title"),
+            "seasonNumbers": season_numbers,
+            "error": "No Sonarr match found",
+        }
     service = sonarr_service(config)
+    try:
+        unmonitored = unmonitor_sonarr_seasons(service, series, season_numbers)
+    except ApiError as exc:
+        return {
+            "ok": False,
+            "kind": "show",
+            "ratingKey": item.get("ratingKey"),
+            "title": item.get("title"),
+            "seasonNumbers": season_numbers,
+            "error": f"Failed to unmonitor selected seasons before deletion: {exc}",
+        }
     episodes = arr_get(service, "/api/v3/episode", {"seriesId": series["id"]})
     episode_file_ids = sorted(
         {
@@ -452,10 +568,13 @@ def delete_seasons(config: dict[str, Any], item: dict[str, Any], season_numbers:
     ok = not errors
     return {
         "ok": ok,
+        "kind": "show",
+        "ratingKey": item.get("ratingKey"),
         "title": item.get("title"),
         "service": "sonarr",
         "matchedTitle": series.get("title"),
         "seasonNumbers": season_numbers,
+        "unmonitoredSeasons": unmonitored,
         "deletedEpisodeFiles": deleted,
         "errors": errors,
     }
@@ -681,6 +800,7 @@ INDEX_HTML = r"""<!doctype html>
       <div class="actions">
         <button id="saveBtn">Save</button>
         <button id="testBtn">Test</button>
+        <button id="loadLibrariesBtn" class="blue">Load libraries</button>
         <button id="scanBtn" class="primary">Scan</button>
         <button id="deleteBtn" class="danger" disabled>Delete selected</button>
       </div>
@@ -696,9 +816,9 @@ INDEX_HTML = r"""<!doctype html>
         <label>Plex URL<input id="plexUrl" placeholder="http://server:32400"></label>
         <label>Plex token<input id="plexToken" type="password"></label>
         <label>Inactive days<input id="inactiveDays" type="number" min="1"></label>
-        <label>Movie library name or key<input id="movieLibrary" placeholder="Movies"></label>
-        <label>TV library name or key<input id="showLibrary" placeholder="TV Shows"></label>
-        <label class="check-label"><input id="addImportExclusion" type="checkbox"> Add Radarr import exclusion</label>
+        <label>Movie library<select id="movieLibrary"><option value="">Load Plex libraries</option></select></label>
+        <label>TV library<select id="showLibrary"><option value="">Load Plex libraries</option></select></label>
+        <label class="check-label"><input id="addImportExclusion" type="checkbox" checked disabled> Prevent Radarr re-downloads</label>
         <label>Radarr URL<input id="radarrUrl" placeholder="http://server:7878"></label>
         <label>Radarr API key<input id="radarrKey" type="password"></label>
         <span></span>
@@ -719,14 +839,22 @@ INDEX_HTML = r"""<!doctype html>
     <section>
       <div class="section-head">
         <h2>Movies</h2>
-        <span id="movieCount" class="status">0</span>
+        <div class="actions">
+          <span id="movieCount" class="status">0</span>
+          <button id="selectAllMoviesBtn">Select all</button>
+          <button id="clearMoviesBtn">Clear</button>
+        </div>
       </div>
       <div id="movies" class="content list"></div>
     </section>
     <section>
       <div class="section-head">
         <h2>TV Shows</h2>
-        <span id="showCount" class="status">0</span>
+        <div class="actions">
+          <span id="showCount" class="status">0</span>
+          <button id="selectAllShowsBtn">Select all</button>
+          <button id="clearShowsBtn">Clear</button>
+        </div>
       </div>
       <div id="shows" class="content list"></div>
     </section>
@@ -738,6 +866,10 @@ INDEX_HTML = r"""<!doctype html>
 <script>
 const state = { config: null, scan: null };
 const $ = (id) => document.getElementById(id);
+
+function selectedValueOrText(select) {
+  return select.value || select.dataset.pendingValue || "";
+}
 
 function formatDate(ts) {
   if (!ts) return "never";
@@ -763,43 +895,112 @@ function updateDeleteButton() {
   $("deleteBtn").disabled = count === 0;
 }
 
+function setMovieSelection(checked) {
+  document.querySelectorAll(".movie-select").forEach(el => {
+    el.checked = checked;
+  });
+  updateDeleteButton();
+}
+
+function setShowSelection(checked) {
+  document.querySelectorAll(".show-select").forEach(el => {
+    if (el.disabled) return;
+    el.checked = checked;
+    document.querySelectorAll(`.season-select[data-show="${el.value}"]`).forEach(season => {
+      season.disabled = checked;
+      if (checked) season.checked = false;
+    });
+  });
+  document.querySelectorAll(".season-select").forEach(el => {
+    if (!el.disabled) el.checked = checked;
+  });
+  updateDeleteButton();
+}
+
 function readConfig() {
   return {
     plex: {
       url: $("plexUrl").value,
       token: $("plexToken").value,
-      movie_library: $("movieLibrary").value,
-      show_library: $("showLibrary").value,
+      movie_library: selectedValueOrText($("movieLibrary")),
+      show_library: selectedValueOrText($("showLibrary")),
     },
     radarr: {
       url: $("radarrUrl").value,
       api_key: $("radarrKey").value,
-      add_import_exclusion: $("addImportExclusion").checked,
+      add_import_exclusion: true,
     },
     sonarr: {
       url: $("sonarrUrl").value,
       api_key: $("sonarrKey").value,
     },
     scan: {
-      inactive_days: Number($("inactiveDays").value || 180),
+      inactive_days: Number($("inactiveDays").value || 365),
       include_never_watched: true,
       include_watched_before_cutoff: true,
     },
   };
 }
 
+function setLibraryPending(select, value) {
+  select.dataset.pendingValue = value || "";
+  if (!select.options.length || (select.options.length === 1 && !select.options[0].value)) {
+    select.innerHTML = `<option value="">${value ? `Saved: ${escapeHtml(value)}` : "Load Plex libraries"}</option>`;
+  }
+}
+
 function fillConfig(config) {
   state.config = config;
   $("plexUrl").value = config.plex.url || "";
   $("plexToken").value = config.plex.token || "";
-  $("movieLibrary").value = config.plex.movie_library || "";
-  $("showLibrary").value = config.plex.show_library || "";
-  $("inactiveDays").value = config.scan.inactive_days || 180;
+  setLibraryPending($("movieLibrary"), config.plex.movie_library || "");
+  setLibraryPending($("showLibrary"), config.plex.show_library || "");
+  $("inactiveDays").value = config.scan.inactive_days || 365;
   $("radarrUrl").value = config.radarr.url || "";
   $("radarrKey").value = config.radarr.api_key || "";
-  $("addImportExclusion").checked = Boolean(config.radarr.add_import_exclusion);
+  $("addImportExclusion").checked = true;
   $("sonarrUrl").value = config.sonarr.url || "";
   $("sonarrKey").value = config.sonarr.api_key || "";
+}
+
+function renderLibrarySelect(select, libraries, type, savedValue) {
+  const matching = libraries.filter(library => library.type === type);
+  const saved = savedValue || select.dataset.pendingValue || "";
+  const matched = matching.find(library => library.key === saved || library.title.toLowerCase() === saved.toLowerCase());
+  const missingSaved = saved && !matched ? `<option value="${escapeHtml(saved)}">Saved: ${escapeHtml(saved)} (not found)</option>` : "";
+  select.innerHTML = `<option value="">Do not scan ${type === "movie" ? "movies" : "TV"}</option>` + missingSaved + matching.map(library => {
+    const label = `${escapeHtml(library.title)} (${library.key})`;
+    return `<option value="${escapeHtml(library.key)}">${label}</option>`;
+  }).join("");
+  select.value = matched ? matched.key : (saved || "");
+  select.dataset.pendingValue = matched ? "" : saved;
+}
+
+async function loadLibraries(options = {}) {
+  const saveBefore = options.saveBefore !== false;
+  const saveAfter = options.saveAfter !== false;
+  const quiet = Boolean(options.quiet);
+  if (saveBefore) await saveConfig();
+  if (!quiet) $("connectionStatus").textContent = "Loading libraries...";
+  const libraries = await api("/api/libraries", { method: "POST", body: JSON.stringify(readConfig()) });
+  renderLibrarySelect($("movieLibrary"), libraries, "movie", selectedValueOrText($("movieLibrary")));
+  renderLibrarySelect($("showLibrary"), libraries, "show", selectedValueOrText($("showLibrary")));
+  const movieCount = libraries.filter(library => library.type === "movie").length;
+  const showCount = libraries.filter(library => library.type === "show").length;
+  $("connectionStatus").textContent = `Loaded ${movieCount} movie and ${showCount} TV libraries`;
+  if (saveAfter) await saveConfig();
+}
+
+async function loadSavedLibrariesIfPossible() {
+  const config = readConfig();
+  const hasPlex = config.plex.url && config.plex.token;
+  const hasSavedLibrary = config.plex.movie_library || config.plex.show_library;
+  if (!hasPlex || !hasSavedLibrary) return;
+  try {
+    await loadLibraries({ saveBefore: false, saveAfter: false, quiet: true });
+  } catch (err) {
+    $("connectionStatus").textContent = "Saved libraries not loaded";
+  }
 }
 
 async function api(path, options = {}) {
@@ -864,6 +1065,7 @@ function renderScan() {
   $("showCount").textContent = String(state.scan.shows.length);
   $("movies").innerHTML = state.scan.movies.length ? state.scan.movies.map(renderMovie).join("") : `<div class="status">No movie candidates.</div>`;
   $("shows").innerHTML = state.scan.shows.length ? state.scan.shows.map(renderShow).join("") : `<div class="status">No show candidates.</div>`;
+  renderSkippedNoFile();
   document.querySelectorAll("input[type=checkbox]").forEach(el => el.addEventListener("change", updateDeleteButton));
   document.querySelectorAll(".show-select").forEach(el => el.addEventListener("change", () => {
     document.querySelectorAll(`.season-select[data-show="${el.value}"]`).forEach(season => {
@@ -873,6 +1075,14 @@ function renderScan() {
     updateDeleteButton();
   }));
   updateDeleteButton();
+}
+
+function renderSkippedNoFile() {
+  const skipped = state.scan.skippedNoFile || {};
+  const messages = [...(state.scan.warnings || [])];
+  if (skipped.movies) messages.push(`Skipped ${skipped.movies} movie metadata item${skipped.movies === 1 ? "" : "s"} with no file.`);
+  if (skipped.episodes) messages.push(`Skipped ${skipped.episodes} TV episode metadata item${skipped.episodes === 1 ? "" : "s"} with no file.`);
+  $("warnings").textContent = messages.join(" ");
 }
 
 function renderMovie(movie) {
@@ -890,20 +1100,22 @@ function renderMovie(movie) {
 function renderShow(show) {
   const year = show.year ? ` (${show.year})` : "";
   const wholeDisabled = show.canDeleteWholeShow ? "" : "disabled";
-  const wholeHelp = show.canDeleteWholeShow ? "Select whole show or individual seasons" : "Whole show is locked because some seasons were watched recently";
+  const wholeHelp = show.canDeleteWholeShow
+    ? "Whole show delete removes it from Sonarr"
+    : "Season delete removes files and unmonitors seasons; Sonarr keeps the show";
   return `<div class="item">
     <div class="row">
       <input class="show-select" type="checkbox" value="${show.ratingKey}" ${wholeDisabled} title="${escapeHtml(wholeHelp)}">
-      <div><div class="title">${escapeHtml(show.title)}${year}</div><div class="sub">${wholeHelp}</div></div>
+      <div><div class="title">${escapeHtml(show.title)}${year}</div><div class="sub">${wholeHelp}; latest watched ${formatDate(show.lastViewedAt)}</div></div>
       <span class="pill">${show.sizeText} inactive</span>
       <span class="sub">${idsText(show.ids)}</span>
     </div>
     <details class="seasons" open>
       <summary>${show.seasons.length} season${show.seasons.length === 1 ? "" : "s"}</summary>
       ${show.seasons.map(season => `<div class="season">
-        <input class="season-select" data-show="${show.ratingKey}" type="checkbox" value="${season.seasonNumber}">
-        <div><div class="title">${escapeHtml(season.title)}</div><div class="sub">${season.candidateEpisodeCount}/${season.episodeCount} episodes inactive</div></div>
-        <span class="pill">${season.sizeText}</span>
+        <input class="season-select" data-show="${show.ratingKey}" type="checkbox" value="${season.seasonNumber}" ${season.candidate ? "" : "disabled"}>
+        <div><div class="title">${escapeHtml(season.title)}</div><div class="sub">${season.reason}; ${season.watchedEpisodeCount}/${season.episodeCount} episodes watched; latest watched ${formatDate(season.lastViewedAt)}</div></div>
+        <span class="pill ${season.candidate ? "danger" : "ok"}">${season.sizeText}</span>
       </div>`).join("")}
     </details>
   </div>`;
@@ -922,6 +1134,52 @@ function humanBytes(size) {
   }
 }
 
+function latestTimestamp(values) {
+  const timestamps = values.filter(Boolean).map(Number);
+  return timestamps.length ? Math.max(...timestamps) : null;
+}
+
+function refreshShowCandidateFields(show) {
+  const inactiveSeasons = show.seasons.filter(season => season.candidate);
+  show.size = inactiveSeasons.reduce((sum, season) => sum + Number(season.size || 0), 0);
+  show.sizeText = humanBytes(show.size);
+  show.lastViewedAt = latestTimestamp(show.seasons.map(season => season.lastViewedAt));
+  show.canDeleteWholeShow = show.seasons.length > 0 && inactiveSeasons.length === show.seasons.length;
+  return show;
+}
+
+function removeDeletedFromScan(result) {
+  if (!state.scan || !result || !Array.isArray(result.results)) return 0;
+  let removed = 0;
+  for (const item of result.results) {
+    if (!item.ok) continue;
+    if (item.kind === "movie") {
+      const before = state.scan.movies.length;
+      state.scan.movies = state.scan.movies.filter(movie => movie.ratingKey !== item.ratingKey);
+      removed += before - state.scan.movies.length;
+      continue;
+    }
+    if (item.kind === "show" && item.deleteWholeShow) {
+      const before = state.scan.shows.length;
+      state.scan.shows = state.scan.shows.filter(show => show.ratingKey !== item.ratingKey);
+      removed += before - state.scan.shows.length;
+      continue;
+    }
+    if (item.kind === "show" && Array.isArray(item.seasonNumbers)) {
+      const seasonNumbers = new Set(item.seasonNumbers.map(Number));
+      state.scan.shows = state.scan.shows.map(show => {
+        if (show.ratingKey !== item.ratingKey) return show;
+        const before = show.seasons.length;
+        show.seasons = show.seasons.filter(season => !seasonNumbers.has(Number(season.seasonNumber)));
+        removed += before - show.seasons.length;
+        return refreshShowCandidateFields(show);
+      }).filter(show => show.seasons.some(season => season.candidate));
+    }
+  }
+  renderScan();
+  return removed;
+}
+
 function escapeHtml(value) {
   return String(value).replace(/[&<>"']/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" }[ch]));
 }
@@ -935,8 +1193,10 @@ async function deleteSelected() {
   $("scanStatus").textContent = "Deleting selected media...";
   try {
     const result = await api("/api/delete", { method: "POST", body: JSON.stringify({ config: readConfig(), selection: payload }) });
+    const removed = removeDeletedFromScan(result);
     showLog(result);
-    $("scanStatus").textContent = result.ok ? "Delete completed" : "Delete completed with errors";
+    const suffix = removed ? `; removed ${removed} item${removed === 1 ? "" : "s"} from the list` : "";
+    $("scanStatus").textContent = (result.ok ? "Delete completed" : "Delete completed with errors") + suffix;
   } finally {
     $("deleteBtn").disabled = false;
   }
@@ -945,13 +1205,22 @@ async function deleteSelected() {
 async function init() {
   try {
     fillConfig(await api("/api/config"));
+    loadSavedLibrariesIfPossible();
     $("saveBtn").addEventListener("click", () => saveConfig().catch(err => showLog({ error: err.message })));
     $("testBtn").addEventListener("click", () => testConnections().catch(err => showLog({ error: err.message })));
+    $("loadLibrariesBtn").addEventListener("click", () => loadLibraries().catch(err => {
+      $("connectionStatus").textContent = "Loading libraries failed";
+      showLog({ error: err.message });
+    }));
     $("scanBtn").addEventListener("click", () => scan().catch(err => {
       $("scanStatus").textContent = "Scan failed";
       showLog({ error: err.message });
     }));
     $("deleteBtn").addEventListener("click", () => deleteSelected().catch(err => showLog({ error: err.message })));
+    $("selectAllMoviesBtn").addEventListener("click", () => setMovieSelection(true));
+    $("clearMoviesBtn").addEventListener("click", () => setMovieSelection(false));
+    $("selectAllShowsBtn").addEventListener("click", () => setShowSelection(true));
+    $("clearShowsBtn").addEventListener("click", () => setShowSelection(false));
   } catch (err) {
     showLog({ error: err.message });
   }
@@ -1033,6 +1302,9 @@ class Handler(BaseHTTPRequestHandler):
             elif self.path == "/api/test":
                 config = deep_merge(DEFAULT_CONFIG, self.read_json())
                 self.send_json(test_connections(config))
+            elif self.path == "/api/libraries":
+                config = deep_merge(DEFAULT_CONFIG, self.read_json())
+                self.send_json(plex_libraries(config))
             elif self.path == "/api/scan":
                 config = deep_merge(DEFAULT_CONFIG, self.read_json())
                 save_config(config)
