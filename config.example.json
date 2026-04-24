@@ -1,0 +1,22 @@
+{
+  "plex": {
+    "url": "http://localhost:32400",
+    "token": "",
+    "movie_library": "",
+    "show_library": ""
+  },
+  "radarr": {
+    "url": "http://localhost:7878",
+    "api_key": "",
+    "add_import_exclusion": false
+  },
+  "sonarr": {
+    "url": "http://localhost:8989",
+    "api_key": ""
+  },
+  "scan": {
+    "inactive_days": 180,
+    "include_never_watched": true,
+    "include_watched_before_cutoff": true
+  }
+}
