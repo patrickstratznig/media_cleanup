@@ -15,6 +15,9 @@
     "api_key": "",
     "add_import_list_exclusion": true
   },
+  "delete": {
+    "mode": "arr_plex_disk"
+  },
   "scan": {
     "inactive_days": 365,
     "include_never_watched": true,

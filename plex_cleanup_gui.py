@@ -56,6 +56,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "include_watched_before_cutoff": True,
         "watch_source": "account",
     },
+    "delete": {
+        "mode": "arr_plex_disk",
+    },
 }
 
 
@@ -778,8 +781,6 @@ def scan_media(config: dict[str, Any]) -> dict[str, Any]:
                 watch_source=watch_source,
                 history_entry=movie_history_last_viewed.get(item_rating_key),
             )
-            if not state["candidate"]:
-                continue
             detail = detail_if_needed(config, detail, need_guids=True, need_locations=True)
             size = item_size(detail)
             ids = extract_guid_ids(detail)
@@ -819,13 +820,25 @@ def scan_media(config: dict[str, Any]) -> dict[str, Any]:
                 history_last_viewed=show_history_last_viewed,
             )
             result["skippedNoFile"]["episodes"] += skipped_episodes
-            candidate_seasons = [season for season in all_seasons if season["candidate"]]
-            if not candidate_seasons:
+            if not all_seasons:
                 continue
             total_size = sum(season["size"] for season in all_seasons)
-            candidate_size = sum(season["size"] for season in candidate_seasons)
-            can_delete_whole_show = bool(all_seasons) and len(candidate_seasons) == len(all_seasons)
             last_viewed_at = latest_timestamp([season["lastViewedAt"] for season in all_seasons])
+            show_state = watched_state_for_last_viewed(
+                last_viewed_at,
+                cutoff,
+                "Never watched" if watch_source == "account" else "Never watched by any user",
+                "Not watched recently" if watch_source == "account" else "Not watched recently by any user",
+                "Watched recently" if watch_source == "account" else "Watched recently by any user",
+                last_viewed_by=next(
+                    (
+                        season.get("lastViewedBy")
+                        for season in sorted(all_seasons, key=lambda entry: int(entry.get("lastViewedAt") or 0), reverse=True)
+                        if season.get("lastViewedAt")
+                    ),
+                    None,
+                ),
+            )
             detail = detail_if_needed(config, detail, need_guids=True, need_locations=True)
             ids = extract_guid_ids(detail)
             result["shows"].append(
@@ -834,16 +847,15 @@ def scan_media(config: dict[str, Any]) -> dict[str, Any]:
                     "ratingKey": str(detail.get("ratingKey") or show_rating_key),
                     "title": detail.get("title") or show_episodes[0].get("grandparentTitle") or "Show",
                     "year": detail.get("year"),
-                    "size": candidate_size,
-                    "sizeText": human_size(candidate_size),
+                    "size": total_size,
+                    "sizeText": human_size(total_size),
                     "totalSize": total_size,
                     "totalSizeText": human_size(total_size),
-                    "canDeleteWholeShow": can_delete_whole_show,
+                    "canDeleteWholeShow": bool(all_seasons),
                     "lastViewedAt": last_viewed_at,
-                    "lastViewedBy": next(
-                        (season.get("lastViewedBy") for season in sorted(all_seasons, key=lambda entry: int(entry.get("lastViewedAt") or 0), reverse=True) if season.get("lastViewedAt")),
-                        None,
-                    ),
+                    "lastViewedBy": show_state["lastViewedBy"],
+                    "reason": show_state["reason"],
+                    "candidate": show_state["candidate"],
                     "ids": ids,
                     "locations": extract_locations(detail),
                     "seasons": all_seasons,
@@ -858,6 +870,19 @@ def radarr_service(config: dict[str, Any]) -> Service:
 
 def sonarr_service(config: dict[str, Any]) -> Service:
     return Service(normalize_url(config["sonarr"]["url"]), api_key=config["sonarr"]["api_key"].strip())
+
+
+def delete_mode(config: dict[str, Any]) -> str:
+    mode = str(config.get("delete", {}).get("mode") or "arr_plex_disk")
+    return mode if mode in {"arr_only", "arr_plex_disk"} else "arr_plex_disk"
+
+
+def delete_mode_deletes_plex(config: dict[str, Any]) -> bool:
+    return delete_mode(config) == "arr_plex_disk"
+
+
+def delete_mode_deletes_arr_files(config: dict[str, Any]) -> bool:
+    return delete_mode(config) == "arr_plex_disk"
 
 
 def plex_delete_metadata_item(config: dict[str, Any], rating_key: Any) -> None:
@@ -962,32 +987,43 @@ def match_sonarr_series(config: dict[str, Any], item: dict[str, Any]) -> dict[st
 
 
 def delete_movie(config: dict[str, Any], item: dict[str, Any]) -> dict[str, Any]:
+    mode = delete_mode(config)
+    delete_arr_files = delete_mode_deletes_arr_files(config)
+    delete_from_plex = delete_mode_deletes_plex(config)
     movie = match_radarr_movie(config, item)
     deleted_from = []
     errors = []
     if movie:
         try:
             params = {
-                "deleteFiles": "true",
+                "deleteFiles": "true" if delete_arr_files else "false",
                 "addImportExclusion": "true",
             }
             arr_delete(radarr_service(config), f"/api/v3/movie/{movie['id']}", params)
             deleted_from.append("radarr")
         except Exception as exc:
             errors.append(f"Radarr delete failed: {exc}")
-    else:
+    elif delete_from_plex:
         errors.append("No Radarr match found; deleting through Plex only")
-    try:
-        plex_delete_metadata_item(config, item.get("ratingKey"))
-        deleted_from.append("plex")
-    except Exception as exc:
-        errors.append(f"Plex delete failed: {exc}")
-    ok = "plex" in deleted_from
+    else:
+        errors.append("No Radarr match found")
+    if delete_from_plex:
+        try:
+            plex_delete_metadata_item(config, item.get("ratingKey"))
+            deleted_from.append("plex")
+        except Exception as exc:
+            errors.append(f"Plex delete failed: {exc}")
+    arr_satisfied = ("radarr" in deleted_from) or (movie is None and delete_from_plex)
+    plex_satisfied = (not delete_from_plex) or ("plex" in deleted_from)
+    ok = arr_satisfied and plex_satisfied
     return {
         "ok": ok,
         "kind": "movie",
         "ratingKey": item.get("ratingKey"),
         "title": item.get("title"),
+        "deleteMode": mode,
+        "deletedFromArr": "radarr" in deleted_from,
+        "deletedFromPlex": "plex" in deleted_from,
         "service": ",".join(deleted_from) if deleted_from else "",
         "matchedTitle": movie.get("title") if movie else None,
         "errors": errors,
@@ -996,6 +1032,9 @@ def delete_movie(config: dict[str, Any], item: dict[str, Any]) -> dict[str, Any]
 
 
 def delete_show(config: dict[str, Any], item: dict[str, Any]) -> dict[str, Any]:
+    mode = delete_mode(config)
+    delete_arr_files = delete_mode_deletes_arr_files(config)
+    delete_from_plex = delete_mode_deletes_plex(config)
     series = match_sonarr_series(config, item)
     deleted_from = []
     errors = []
@@ -1005,27 +1044,35 @@ def delete_show(config: dict[str, Any], item: dict[str, Any]) -> dict[str, Any]:
                 sonarr_service(config),
                 f"/api/v3/series/{series['id']}",
                 {
-                    "deleteFiles": "true",
+                    "deleteFiles": "true" if delete_arr_files else "false",
                     "addImportListExclusion": "true",
                 },
             )
             deleted_from.append("sonarr")
         except Exception as exc:
             errors.append(f"Sonarr delete failed: {exc}")
-    else:
+    elif delete_from_plex:
         errors.append("No Sonarr match found; deleting through Plex only")
-    try:
-        plex_delete_metadata_item(config, item.get("ratingKey"))
-        deleted_from.append("plex")
-    except Exception as exc:
-        errors.append(f"Plex delete failed: {exc}")
-    ok = "plex" in deleted_from
+    else:
+        errors.append("No Sonarr match found")
+    if delete_from_plex:
+        try:
+            plex_delete_metadata_item(config, item.get("ratingKey"))
+            deleted_from.append("plex")
+        except Exception as exc:
+            errors.append(f"Plex delete failed: {exc}")
+    arr_satisfied = ("sonarr" in deleted_from) or (series is None and delete_from_plex)
+    plex_satisfied = (not delete_from_plex) or ("plex" in deleted_from)
+    ok = arr_satisfied and plex_satisfied
     return {
         "ok": ok,
         "kind": "show",
         "ratingKey": item.get("ratingKey"),
         "deleteWholeShow": True,
         "title": item.get("title"),
+        "deleteMode": mode,
+        "deletedFromArr": "sonarr" in deleted_from,
+        "deletedFromPlex": "plex" in deleted_from,
         "service": ",".join(deleted_from) if deleted_from else "",
         "matchedTitle": series.get("title") if series else None,
         "errors": errors,
@@ -1046,6 +1093,9 @@ def unmonitor_sonarr_seasons(service: Service, series: dict[str, Any], season_nu
 
 
 def delete_seasons(config: dict[str, Any], item: dict[str, Any], season_numbers: list[int]) -> dict[str, Any]:
+    mode = delete_mode(config)
+    delete_arr_files = delete_mode_deletes_arr_files(config)
+    delete_from_plex = delete_mode_deletes_plex(config)
     series = match_sonarr_series(config, item)
     errors = []
     deleted_from = []
@@ -1055,39 +1105,49 @@ def delete_seasons(config: dict[str, Any], item: dict[str, Any], season_numbers:
         try:
             service = sonarr_service(config)
             unmonitored = unmonitor_sonarr_seasons(service, series, season_numbers)
-            episodes = arr_get(service, "/api/v3/episode", {"seriesId": series["id"]})
-            episode_file_ids = sorted(
-                {
-                    episode.get("episodeFileId")
-                    for episode in episodes
-                    if episode.get("seasonNumber") in season_numbers and episode.get("episodeFileId")
-                }
-            )
-            for episode_file_id in episode_file_ids:
-                try:
-                    arr_delete(service, f"/api/v3/episodeFile/{episode_file_id}")
-                    deleted += 1
-                except ApiError as exc:
-                    errors.append(str(exc))
+            if delete_arr_files:
+                episodes = arr_get(service, "/api/v3/episode", {"seriesId": series["id"]})
+                episode_file_ids = sorted(
+                    {
+                        episode.get("episodeFileId")
+                        for episode in episodes
+                        if episode.get("seasonNumber") in season_numbers and episode.get("episodeFileId")
+                    }
+                )
+                for episode_file_id in episode_file_ids:
+                    try:
+                        arr_delete(service, f"/api/v3/episodeFile/{episode_file_id}")
+                        deleted += 1
+                    except ApiError as exc:
+                        errors.append(str(exc))
             if not errors:
                 deleted_from.append("sonarr")
         except ApiError as exc:
             errors.append(f"Sonarr delete failed: {exc}")
-    else:
+    elif delete_from_plex:
         errors.append("No Sonarr match found; deleting through Plex only")
-    plex_result = plex_delete_selected_seasons(config, item, season_numbers)
-    if not plex_result["errors"]:
-        deleted_from.append("plex")
     else:
-        errors.extend(plex_result["errors"])
-        if plex_result["deletedSeasons"] or plex_result["deletedEpisodes"]:
+        errors.append("No Sonarr match found")
+    plex_result = {"deletedSeasons": 0, "deletedEpisodes": 0, "errors": []}
+    if delete_from_plex:
+        plex_result = plex_delete_selected_seasons(config, item, season_numbers)
+        if not plex_result["errors"]:
             deleted_from.append("plex")
-    ok = "plex" in deleted_from
+        else:
+            errors.extend(plex_result["errors"])
+            if plex_result["deletedSeasons"] or plex_result["deletedEpisodes"]:
+                deleted_from.append("plex")
+    sonarr_satisfied = ("sonarr" in deleted_from) or (series is None and delete_from_plex)
+    plex_satisfied = (not delete_from_plex) or ("plex" in deleted_from)
+    ok = sonarr_satisfied and plex_satisfied
     return {
         "ok": ok,
         "kind": "show",
         "ratingKey": item.get("ratingKey"),
         "title": item.get("title"),
+        "deleteMode": mode,
+        "deletedFromArr": "sonarr" in deleted_from,
+        "deletedFromPlex": "plex" in deleted_from,
         "service": ",".join(deleted_from) if deleted_from else "",
         "matchedTitle": series.get("title") if series else None,
         "seasonNumbers": season_numbers,
@@ -1214,6 +1274,44 @@ INDEX_HTML = r"""<!doctype html>
       grid-template-columns: repeat(3, minmax(0, 1fr));
       gap: 12px;
     }
+    .connections-layout {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+    .connection-card {
+      background: linear-gradient(180deg, #ffffff 0%, #f7fafb 100%);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 14px;
+      display: grid;
+      gap: 12px;
+    }
+    .connection-card.wide {
+      grid-column: 1 / -1;
+    }
+    .card-head {
+      display: grid;
+      gap: 4px;
+    }
+    .card-title {
+      font-size: 14px;
+      font-weight: 800;
+      color: var(--text);
+    }
+    .card-subtitle {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+    .field-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }
+    .field-span-2 {
+      grid-column: span 2;
+    }
     label { display: grid; gap: 5px; color: var(--muted); font-size: 12px; font-weight: 650; }
     .inline-field {
       display: flex;
@@ -1239,6 +1337,19 @@ INDEX_HTML = r"""<!doctype html>
       font-size: 12px;
       font-weight: 500;
       line-height: 1.4;
+    }
+    .setting-note {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 38px;
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fbfcfd;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
     }
     input, select {
       min-width: 0;
@@ -1269,6 +1380,19 @@ INDEX_HTML = r"""<!doctype html>
     button:disabled { opacity: 0.55; cursor: not-allowed; }
     .status { color: var(--muted); font-size: 13px; }
     .status strong { color: var(--text); }
+    .status-stack {
+      display: grid;
+      justify-items: end;
+      gap: 4px;
+      text-align: right;
+    }
+    .status-label {
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
     .pill {
       display: inline-flex;
       align-items: center;
@@ -1338,10 +1462,12 @@ INDEX_HTML = r"""<!doctype html>
       font-size: 12px;
     }
     @media (max-width: 820px) {
-      .grid, .summary { grid-template-columns: 1fr; }
+      .grid, .summary, .connections-layout, .field-grid { grid-template-columns: 1fr; }
+      .connection-card.wide, .field-span-2 { grid-column: auto; }
       .row { grid-template-columns: 28px 1fr; }
       .row > .pill, .row > .sub { justify-self: start; grid-column: 2; }
       .bar { align-items: flex-start; flex-direction: column; }
+      .status-stack { justify-items: start; text-align: left; }
     }
   </style>
 </head>
@@ -1361,27 +1487,57 @@ INDEX_HTML = r"""<!doctype html>
   <main>
     <section>
       <div class="section-head">
-        <h2>Connections</h2>
-        <span id="connectionStatus" class="status">Not tested</span>
+        <h2>Settings</h2>
+        <div class="actions">
+          <button id="toggleSettingsBtn">Collapse</button>
+          <div class="status-stack">
+            <span class="status-label">Status</span>
+            <span id="connectionStatus" class="status">Not tested</span>
+          </div>
+        </div>
       </div>
-      <div class="content grid">
-        <label>Plex URL<input id="plexUrl" placeholder="http://server:32400"></label>
-        <label>Plex admin token<input id="plexToken" type="password"><a class="help-link" href="https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token/" target="_blank" rel="noreferrer">How to find your Plex token</a><span class="help-text">Click <b>Test</b> to check for admin rights.</span></label>
-        <label>Inactive days<input id="inactiveDays" type="number" min="1"></label>
-        <label>Watch data<select id="watchSource"><option value="account">This Plex account</option><option value="all_users">Any user on server</option></select></label>
-        <label>Movie library<select id="movieLibrary"><option value="">Load Plex libraries</option></select></label>
-        <label>TV library<select id="showLibrary"><option value="">Load Plex libraries</option></select></label>
-        <label class="check-label"><input id="addImportExclusion" type="checkbox" checked disabled> Prevent Radarr re-downloads</label>
-        <label>Radarr URL<input id="radarrUrl" placeholder="http://server:7878"></label>
-        <label>Radarr API key<input id="radarrKey" type="password"></label>
-        <span></span>
-        <label>Sonarr URL<input id="sonarrUrl" placeholder="http://server:8989"></label>
-        <label>Sonarr API key<input id="sonarrKey" type="password"></label>
+      <div id="settingsPanel" class="content connections-layout">
+        <div class="connection-card">
+          <div class="card-head">
+            <div class="card-title">Plex</div>
+            <div class="card-subtitle">Server access, watch history mode, and the libraries we scan.</div>
+          </div>
+          <div class="field-grid">
+            <label class="field-span-2">Plex URL<input id="plexUrl" placeholder="http://server:32400"></label>
+            <label class="field-span-2">Plex admin token<input id="plexToken" type="password"><a class="help-link" href="https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token/" target="_blank" rel="noreferrer">How to find your Plex token</a><span class="help-text">Click <b>Test</b> to check for admin rights.</span></label>
+            <label>Watch data<select id="watchSource"><option value="account">This Plex account</option><option value="all_users">Any user on server</option></select></label>
+            <label>Filter days<input id="inactiveDays" type="number" min="1"></label>
+            <label>Movie library<select id="movieLibrary"><option value="">Load Plex libraries</option></select></label>
+            <label>TV library<select id="showLibrary"><option value="">Load Plex libraries</option></select></label>
+          </div>
+        </div>
+        <div class="connection-card">
+          <div class="card-head">
+            <div class="card-title">Automation</div>
+            <div class="card-subtitle">Radarr and Sonarr are used for matching, cleanup, and preventing re-downloads.</div>
+          </div>
+          <div class="field-grid">
+            <label>Radarr URL<input id="radarrUrl" placeholder="http://server:7878"></label>
+            <label>Radarr API key<input id="radarrKey" type="password"></label>
+            <label>Sonarr URL<input id="sonarrUrl" placeholder="http://server:8989"></label>
+            <label>Sonarr API key<input id="sonarrKey" type="password"></label>
+          </div>
+        </div>
+        <div class="connection-card wide">
+          <div class="card-head">
+            <div class="card-title">Delete Behavior</div>
+            <div class="card-subtitle">Choose whether delete actions only update Radarr or Sonarr, or also remove the media from Plex and disk.</div>
+          </div>
+          <div class="field-grid">
+            <label>Delete target<select id="deleteMode"><option value="arr_plex_disk">Radarr/Sonarr + Plex/disk</option><option value="arr_only">Radarr/Sonarr only</option></select></label>
+            <div class="setting-note">Whole-show deletes remove the full series from Sonarr. Season-only deletes unmonitor the selected seasons in Sonarr and only remove Plex files when Plex/disk deletion is enabled.</div>
+          </div>
+        </div>
       </div>
     </section>
     <section>
       <div class="section-head">
-        <h2>Candidates</h2>
+        <h2>Results</h2>
         <span id="scanStatus" class="status">Run a scan to begin</span>
       </div>
       <div class="content">
@@ -1395,6 +1551,7 @@ INDEX_HTML = r"""<!doctype html>
         <div class="actions">
           <span id="movieCount" class="status">0</span>
           <label class="inline-field">Sort<select id="movieSort"><option value="title_asc">A-Z</option><option value="title_desc">Z-A</option><option value="size_desc">Largest</option><option value="size_asc">Smallest</option></select></label>
+          <label class="inline-field">Filter<select id="movieFilter"><option value="all">All</option><option value="never">Never watched</option><option value="older">Not watched in set days</option><option value="recent">Watched in set days</option></select></label>
           <button id="toggleMoviesBtn">Collapse</button>
           <button id="selectAllMoviesBtn">Select all</button>
           <button id="clearMoviesBtn">Clear</button>
@@ -1408,6 +1565,7 @@ INDEX_HTML = r"""<!doctype html>
         <div class="actions">
           <span id="showCount" class="status">0</span>
           <label class="inline-field">Sort<select id="showSort"><option value="title_asc">A-Z</option><option value="title_desc">Z-A</option><option value="size_desc">Largest</option><option value="size_asc">Smallest</option></select></label>
+          <label class="inline-field">Filter<select id="showFilter"><option value="all">All</option><option value="never">Never watched</option><option value="older">Not watched in set days</option><option value="recent">Watched in set days</option></select></label>
           <button id="toggleShowsBtn">Collapse</button>
           <button id="selectAllShowsBtn">Select all</button>
           <button id="clearShowsBtn">Clear</button>
@@ -1424,9 +1582,17 @@ INDEX_HTML = r"""<!doctype html>
 const state = {
   config: null,
   scan: null,
+  selection: {
+    movies: new Set(),
+    shows: new Set(),
+    seasons: new Set(),
+  },
   ui: {
     movieSort: "title_asc",
+    movieFilter: "all",
     showSort: "title_asc",
+    showFilter: "all",
+    settingsCollapsed: false,
     moviesCollapsed: false,
     showsCollapsed: false,
   },
@@ -1445,6 +1611,57 @@ function formatDate(ts) {
 function formatWatchedSummary(label, ts, watcher) {
   const suffix = watcher ? ` by ${escapeHtml(watcher)}` : "";
   return `${label} ${formatDate(ts)}${suffix}`;
+}
+
+function formatLastWatchedOrNever(ts, watcher, label = "last watched") {
+  if (!ts) return "never";
+  return formatWatchedSummary(label, ts, watcher);
+}
+
+function seasonSelectionKey(showKey, seasonNumber) {
+  return `${showKey}:${seasonNumber}`;
+}
+
+function currentInactiveDays() {
+  const value = Number($("inactiveDays")?.value || state.scan?.inactiveDays || 365);
+  return value > 0 ? value : 365;
+}
+
+function currentCutoff() {
+  return Math.floor(Date.now() / 1000) - currentInactiveDays() * 86400;
+}
+
+function watchStateForLastViewed(lastViewedAt) {
+  const allUsers = state.scan?.watchSource === "all_users";
+  if (!lastViewedAt) {
+    return {
+      candidate: true,
+      reason: allUsers ? "Never watched by any user" : "Never watched",
+    };
+  }
+  if (Number(lastViewedAt) < currentCutoff()) {
+    return {
+      candidate: true,
+      reason: allUsers ? "Not watched recently by any user" : "Not watched recently",
+    };
+  }
+  return {
+    candidate: false,
+    reason: allUsers ? "Watched recently by any user" : "Watched recently",
+  };
+}
+
+function matchesWatchFilter(lastViewedAt, filterMode) {
+  if (filterMode === "never") return !lastViewedAt;
+  if (filterMode === "older") return !lastViewedAt || Number(lastViewedAt) < currentCutoff();
+  if (filterMode === "recent") return Boolean(lastViewedAt && Number(lastViewedAt) >= currentCutoff());
+  return true;
+}
+
+function clearSelectionState() {
+  state.selection.movies.clear();
+  state.selection.shows.clear();
+  state.selection.seasons.clear();
 }
 
 function compareText(left, right) {
@@ -1466,23 +1683,31 @@ function sortItems(items, sortMode) {
   });
 }
 
-function selectionSnapshot() {
-  return {
-    movies: new Set([...document.querySelectorAll(".movie-select:checked")].map(el => el.value)),
-    shows: new Set([...document.querySelectorAll(".show-select:checked")].map(el => el.value)),
-    seasons: new Set([...document.querySelectorAll(".season-select:checked")].map(el => `${el.dataset.show}:${el.value}`)),
-  };
+function filteredMovies() {
+  const movies = state.scan?.movies || [];
+  return sortItems(
+    movies.filter(movie => matchesWatchFilter(movie.lastViewedAt, state.ui.movieFilter)),
+    state.ui.movieSort,
+  );
 }
 
-function restoreSelection(snapshot) {
+function filteredShows() {
+  const shows = state.scan?.shows || [];
+  return sortItems(
+    shows.filter(show => matchesWatchFilter(show.lastViewedAt, state.ui.showFilter)),
+    state.ui.showSort,
+  );
+}
+
+function applySelectionToDom() {
   document.querySelectorAll(".movie-select").forEach(el => {
-    el.checked = snapshot.movies.has(el.value);
+    el.checked = state.selection.movies.has(el.value);
   });
   document.querySelectorAll(".show-select").forEach(el => {
-    el.checked = snapshot.shows.has(el.value);
+    el.checked = state.selection.shows.has(el.value);
   });
   document.querySelectorAll(".season-select").forEach(el => {
-    el.checked = snapshot.seasons.has(`${el.dataset.show}:${el.value}`);
+    el.checked = state.selection.seasons.has(seasonSelectionKey(el.dataset.show, el.value));
   });
 }
 
@@ -1497,29 +1722,52 @@ function syncShowSeasonDisabledStates() {
 
 function applyListUiState() {
   $("movieSort").value = state.ui.movieSort;
+  $("movieFilter").value = state.ui.movieFilter;
   $("showSort").value = state.ui.showSort;
+  $("showFilter").value = state.ui.showFilter;
+  $("settingsPanel").classList.toggle("hidden", state.ui.settingsCollapsed);
   $("movies").classList.toggle("hidden", state.ui.moviesCollapsed);
   $("shows").classList.toggle("hidden", state.ui.showsCollapsed);
+  $("toggleSettingsBtn").textContent = state.ui.settingsCollapsed ? "Expand" : "Collapse";
   $("toggleMoviesBtn").textContent = state.ui.moviesCollapsed ? "Expand" : "Collapse";
   $("toggleShowsBtn").textContent = state.ui.showsCollapsed ? "Expand" : "Collapse";
 }
 
 function bindSelectionListeners() {
-  document.querySelectorAll(".movie-select, .show-select, .season-select").forEach(el => el.addEventListener("change", updateDeleteButton));
+  document.querySelectorAll(".movie-select").forEach(el => el.addEventListener("change", () => {
+    if (el.checked) state.selection.movies.add(el.value);
+    else state.selection.movies.delete(el.value);
+    updateDeleteButton();
+  }));
   document.querySelectorAll(".show-select").forEach(el => el.addEventListener("change", () => {
+    if (el.checked) {
+      state.selection.shows.add(el.value);
+      [...state.selection.seasons]
+        .filter(key => key.startsWith(`${el.value}:`))
+        .forEach(key => state.selection.seasons.delete(key));
+    } else {
+      state.selection.shows.delete(el.value);
+    }
+    applySelectionToDom();
     syncShowSeasonDisabledStates();
+    updateDeleteButton();
+  }));
+  document.querySelectorAll(".season-select").forEach(el => el.addEventListener("change", () => {
+    const key = seasonSelectionKey(el.dataset.show, el.value);
+    state.selection.shows.delete(el.dataset.show);
+    if (el.checked) state.selection.seasons.add(key);
+    else state.selection.seasons.delete(key);
     updateDeleteButton();
   }));
 }
 
 function renderMediaLists() {
-  const snapshot = selectionSnapshot();
-  const movies = sortItems(state.scan?.movies || [], state.ui.movieSort);
-  const shows = sortItems(state.scan?.shows || [], state.ui.showSort);
-  $("movies").innerHTML = movies.length ? movies.map(renderMovie).join("") : `<div class="status">No movie candidates.</div>`;
-  $("shows").innerHTML = shows.length ? shows.map(renderShow).join("") : `<div class="status">No show candidates.</div>`;
+  const movies = filteredMovies();
+  const shows = filteredShows();
+  $("movies").innerHTML = movies.length ? movies.map(renderMovie).join("") : `<div class="status">No movies match the current filter.</div>`;
+  $("shows").innerHTML = shows.length ? shows.map(renderShow).join("") : `<div class="status">No shows match the current filter.</div>`;
   bindSelectionListeners();
-  restoreSelection(snapshot);
+  applySelectionToDom();
   syncShowSeasonDisabledStates();
   applyListUiState();
   updateDeleteButton();
@@ -1527,12 +1775,14 @@ function renderMediaLists() {
 
 function selectedPayload() {
   if (!state.scan) return { movies: [], shows: [] };
-  const movieKeys = new Set([...document.querySelectorAll(".movie-select:checked")].map(el => el.value));
-  const showKeys = new Set([...document.querySelectorAll(".show-select:checked")].map(el => el.value));
+  const movieKeys = state.selection.movies;
+  const showKeys = state.selection.shows;
   const movies = state.scan.movies.filter(movie => movieKeys.has(movie.ratingKey));
   const shows = state.scan.shows.map(show => {
     const whole = showKeys.has(show.ratingKey);
-    const seasonNumbers = [...document.querySelectorAll(`.season-select[data-show="${show.ratingKey}"]:checked`)].map(el => Number(el.value));
+    const seasonNumbers = show.seasons
+      .filter(season => state.selection.seasons.has(seasonSelectionKey(show.ratingKey, season.seasonNumber)))
+      .map(season => Number(season.seasonNumber));
     return { ...show, deleteWholeShow: whole, seasonNumbers };
   }).filter(show => show.deleteWholeShow || show.seasonNumbers.length);
   return { movies, shows };
@@ -1545,24 +1795,26 @@ function updateDeleteButton() {
 }
 
 function setMovieSelection(checked) {
-  document.querySelectorAll(".movie-select").forEach(el => {
-    el.checked = checked;
+  filteredMovies().forEach(movie => {
+    if (checked) state.selection.movies.add(movie.ratingKey);
+    else state.selection.movies.delete(movie.ratingKey);
   });
+  applySelectionToDom();
   updateDeleteButton();
 }
 
 function setShowSelection(checked) {
-  document.querySelectorAll(".show-select").forEach(el => {
-    el.checked = checked;
-    document.querySelectorAll(`.season-select[data-show="${el.value}"]`).forEach(season => {
-      season.disabled = checked;
-      if (checked) season.checked = false;
-    });
+  filteredShows().forEach(show => {
+    if (checked) {
+      state.selection.shows.add(show.ratingKey);
+      show.seasons.forEach(season => state.selection.seasons.delete(seasonSelectionKey(show.ratingKey, season.seasonNumber)));
+      return;
+    }
+    state.selection.shows.delete(show.ratingKey);
+    show.seasons.forEach(season => state.selection.seasons.delete(seasonSelectionKey(show.ratingKey, season.seasonNumber)));
   });
-  document.querySelectorAll(".season-select").forEach(el => {
-    if (checked && el.disabled) return;
-    el.checked = checked;
-  });
+  applySelectionToDom();
+  syncShowSeasonDisabledStates();
   updateDeleteButton();
 }
 
@@ -1582,6 +1834,9 @@ function readConfig() {
     sonarr: {
       url: $("sonarrUrl").value,
       api_key: $("sonarrKey").value,
+    },
+    delete: {
+      mode: $("deleteMode").value || "arr_plex_disk",
     },
     scan: {
       inactive_days: Number($("inactiveDays").value || 365),
@@ -1609,9 +1864,9 @@ function fillConfig(config) {
   $("watchSource").value = config.scan.watch_source || "account";
   $("radarrUrl").value = config.radarr.url || "";
   $("radarrKey").value = config.radarr.api_key || "";
-  $("addImportExclusion").checked = true;
   $("sonarrUrl").value = config.sonarr.url || "";
   $("sonarrKey").value = config.sonarr.api_key || "";
+  $("deleteMode").value = config.delete.mode || "arr_plex_disk";
 }
 
 function renderLibrarySelect(select, libraries, type, savedValue) {
@@ -1710,6 +1965,7 @@ async function scan() {
   updateScanTimer();
   const scanTimer = setInterval(updateScanTimer, 1000);
   try {
+    clearSelectionState();
     state.scan = await api("/api/scan", { method: "POST", body: JSON.stringify(readConfig()) });
     renderScan();
     $("scanStatus").textContent = `Scanned ${new Date(state.scan.generatedAt * 1000).toLocaleString()} in ${formatElapsed(Date.now() - startedAt)}`;
@@ -1720,18 +1976,17 @@ async function scan() {
 }
 
 function renderScan() {
-  const movieTotal = state.scan.movies.reduce((sum, item) => sum + item.size, 0);
-  const showTotal = state.scan.shows.reduce((sum, item) => sum + item.size, 0);
+  if (!state.scan) return;
   $("summary").classList.remove("hidden");
   $("summary").innerHTML = `
-    <div class="metric"><b>${state.scan.movies.length}</b><span>movie candidates</span></div>
-    <div class="metric"><b>${state.scan.shows.length}</b><span>show candidates</span></div>
-    <div class="metric"><b>${humanBytes(movieTotal)}</b><span>movie storage</span></div>
-    <div class="metric"><b>${humanBytes(showTotal)}</b><span>show storage</span></div>
+    <div class="metric"><b>${state.scan.movies.length}</b><span>movies scanned</span></div>
+    <div class="metric"><b>${state.scan.shows.length}</b><span>shows scanned</span></div>
   `;
+  const movies = filteredMovies();
+  const shows = filteredShows();
   $("warnings").textContent = (state.scan.warnings || []).join(" ");
-  $("movieCount").textContent = String(state.scan.movies.length);
-  $("showCount").textContent = String(state.scan.shows.length);
+  $("movieCount").textContent = `${movies.length} of ${state.scan.movies.length}`;
+  $("showCount").textContent = `${shows.length} of ${state.scan.shows.length}`;
   renderSkippedNoFile();
   renderMediaLists();
 }
@@ -1746,12 +2001,13 @@ function renderSkippedNoFile() {
 
 function renderMovie(movie) {
   const year = movie.year ? ` (${movie.year})` : "";
+  const watchState = watchStateForLastViewed(movie.lastViewedAt);
   return `<div class="item">
     <div class="row">
       <input class="movie-select" type="checkbox" value="${movie.ratingKey}">
-      <div><div class="title">${escapeHtml(movie.title)}${year}</div><div class="sub">${movie.reason}; ${formatWatchedSummary("last watched", movie.lastViewedAt, movie.lastViewedBy)}</div></div>
-      <span class="pill">${movie.sizeText}</span>
-      <span class="sub">${idsText(movie.ids)}</span>
+      <div><div class="title">${escapeHtml(movie.title)}${year}</div><div class="sub">${watchState.reason}; ${formatWatchedSummary("last watched", movie.lastViewedAt, movie.lastViewedBy)}</div></div>
+      <span class="pill ${watchState.candidate ? "danger" : "ok"}">${movie.sizeText}</span>
+      <span class="sub">${idsMarkup(movie.ids)}</span>
     </div>
   </div>`;
 }
@@ -1759,26 +2015,87 @@ function renderMovie(movie) {
 function renderShow(show) {
   const year = show.year ? ` (${show.year})` : "";
   const wholeHelp = "Whole show delete removes it from Sonarr; selecting it clears season selections";
+  const watchState = watchStateForLastViewed(show.lastViewedAt);
   return `<div class="item">
     <div class="row">
       <input class="show-select" type="checkbox" value="${show.ratingKey}" title="${escapeHtml(wholeHelp)}">
-      <div><div class="title">${escapeHtml(show.title)}${year}</div><div class="sub">${wholeHelp}; ${formatWatchedSummary("latest watched", show.lastViewedAt, show.lastViewedBy)}</div></div>
-      <span class="pill">${show.sizeText} inactive</span>
-      <span class="sub">${idsText(show.ids)}</span>
+      <div><div class="title">${escapeHtml(show.title)}${year}</div><div class="sub">${watchState.reason}; ${formatWatchedSummary("latest watched", show.lastViewedAt, show.lastViewedBy)}</div></div>
+      <span class="pill ${watchState.candidate ? "danger" : "ok"}">${show.sizeText}</span>
+      <span class="sub">${idsMarkup(show.ids)}</span>
     </div>
     <details class="seasons" open>
       <summary>${show.seasons.length} season${show.seasons.length === 1 ? "" : "s"}</summary>
-      ${show.seasons.map(season => `<div class="season">
+      ${show.seasons.map(season => {
+        const seasonState = watchStateForLastViewed(season.lastViewedAt);
+        return `<div class="season">
         <input class="season-select" data-show="${show.ratingKey}" type="checkbox" value="${season.seasonNumber}">
-        <div><div class="title">${escapeHtml(season.title)}</div><div class="sub">${season.reason}; ${season.watchedEpisodeCount}/${season.episodeCount} episodes watched; ${formatWatchedSummary("latest watched", season.lastViewedAt, season.lastViewedBy)}</div></div>
-        <span class="pill ${season.candidate ? "danger" : "ok"}">${season.sizeText}</span>
-      </div>`).join("")}
+        <div><div class="title">${escapeHtml(season.title)}</div><div class="sub">${season.watchedEpisodeCount}/${season.episodeCount} episodes watched; ${formatLastWatchedOrNever(season.lastViewedAt, season.lastViewedBy, "latest watched")}</div></div>
+        <span class="pill ${seasonState.candidate ? "danger" : "ok"}">${season.sizeText}</span>
+      </div>`;
+      }).join("")}
     </details>
   </div>`;
 }
 
-function idsText(ids) {
-  return Object.entries(ids || {}).map(([key, value]) => `${key}:${value}`).join(" ");
+function imdbUrl(imdbId) {
+  const clean = String(imdbId || "").trim();
+  return clean ? `https://www.imdb.com/title/${encodeURIComponent(clean)}/` : "";
+}
+
+function tmdbUrl(tmdbId) {
+  const clean = String(tmdbId || "").trim();
+  return clean ? `https://www.themoviedb.org/movie/${encodeURIComponent(clean)}` : "";
+}
+
+function tvdbUrl(tvdbId) {
+  const clean = String(tvdbId || "").trim();
+  return clean ? `https://thetvdb.com/dereferrer/series/${encodeURIComponent(clean)}` : "";
+}
+
+function idsMarkup(ids) {
+  const values = ids || {};
+  const parts = Object.entries(values)
+    .filter(([key]) => !["imdb", "tmdb", "tvdb"].includes(key))
+    .map(([key, value]) => `${escapeHtml(key)}:${escapeHtml(value)}`);
+  if (values.tmdb) {
+    parts.push(`<a class="help-link" href="${tmdbUrl(values.tmdb)}" target="_blank" rel="noreferrer">TMDb</a>`);
+  }
+  if (values.tvdb) {
+    parts.push(`<a class="help-link" href="${tvdbUrl(values.tvdb)}" target="_blank" rel="noreferrer">TVDb</a>`);
+  }
+  if (values.imdb) {
+    parts.push(`<a class="help-link" href="${imdbUrl(values.imdb)}" target="_blank" rel="noreferrer">IMDb</a>`);
+  }
+  return parts.join(" ");
+}
+
+function mediaTitleWithYear(item) {
+  const year = item?.year ? ` (${item.year})` : "";
+  return `${item?.title || "Item"}${year}`;
+}
+
+function deletePreview(payload) {
+  const lines = [];
+  let totalSize = 0;
+  for (const movie of payload.movies || []) {
+    const size = Number(movie.size || 0);
+    totalSize += size;
+    lines.push(`- Movie: ${mediaTitleWithYear(movie)} (${humanBytes(size)})`);
+  }
+  for (const show of payload.shows || []) {
+    if (show.deleteWholeShow) {
+      const size = Number(show.totalSize || show.size || 0);
+      totalSize += size;
+      lines.push(`- TV: ${mediaTitleWithYear(show)} - whole show (${humanBytes(size)})`);
+      continue;
+    }
+    const selectedSeasons = (show.seasons || []).filter(season => (show.seasonNumbers || []).includes(Number(season.seasonNumber)));
+    const size = selectedSeasons.reduce((sum, season) => sum + Number(season.size || 0), 0);
+    totalSize += size;
+    const seasonNames = selectedSeasons.map(season => season.title || `Season ${season.seasonNumber}`).join(", ");
+    lines.push(`- TV: ${mediaTitleWithYear(show)} - ${seasonNames} (${humanBytes(size)})`);
+  }
+  return { lines, totalSize };
 }
 
 function humanBytes(size) {
@@ -1796,15 +2113,16 @@ function latestTimestamp(values) {
 }
 
 function refreshShowCandidateFields(show) {
-  const inactiveSeasons = show.seasons.filter(season => season.candidate);
-  show.size = inactiveSeasons.reduce((sum, season) => sum + Number(season.size || 0), 0);
+  show.size = show.seasons.reduce((sum, season) => sum + Number(season.size || 0), 0);
   show.sizeText = humanBytes(show.size);
+  show.totalSize = show.size;
+  show.totalSizeText = show.sizeText;
   const latestSeason = [...show.seasons]
     .filter(season => season.lastViewedAt)
     .sort((left, right) => Number(right.lastViewedAt) - Number(left.lastViewedAt))[0];
   show.lastViewedAt = latestSeason ? latestSeason.lastViewedAt : null;
   show.lastViewedBy = latestSeason ? latestSeason.lastViewedBy || null : null;
-  show.canDeleteWholeShow = show.seasons.length > 0 && inactiveSeasons.length === show.seasons.length;
+  show.canDeleteWholeShow = show.seasons.length > 0;
   return show;
 }
 
@@ -1814,12 +2132,19 @@ function removeDeletedFromScan(result) {
   for (const item of result.results) {
     if (!item.ok) continue;
     if (item.kind === "movie") {
+      state.selection.movies.delete(item.ratingKey);
+      if (!item.deletedFromPlex) continue;
       const before = state.scan.movies.length;
       state.scan.movies = state.scan.movies.filter(movie => movie.ratingKey !== item.ratingKey);
       removed += before - state.scan.movies.length;
       continue;
     }
     if (item.kind === "show" && item.deleteWholeShow) {
+      state.selection.shows.delete(item.ratingKey);
+      [...state.selection.seasons]
+        .filter(key => key.startsWith(`${item.ratingKey}:`))
+        .forEach(key => state.selection.seasons.delete(key));
+      if (!item.deletedFromPlex) continue;
       const before = state.scan.shows.length;
       state.scan.shows = state.scan.shows.filter(show => show.ratingKey !== item.ratingKey);
       removed += before - state.scan.shows.length;
@@ -1827,13 +2152,15 @@ function removeDeletedFromScan(result) {
     }
     if (item.kind === "show" && Array.isArray(item.seasonNumbers)) {
       const seasonNumbers = new Set(item.seasonNumbers.map(Number));
+      seasonNumbers.forEach(seasonNumber => state.selection.seasons.delete(seasonSelectionKey(item.ratingKey, seasonNumber)));
+      if (!item.deletedFromPlex) continue;
       state.scan.shows = state.scan.shows.map(show => {
         if (show.ratingKey !== item.ratingKey) return show;
         const before = show.seasons.length;
         show.seasons = show.seasons.filter(season => !seasonNumbers.has(Number(season.seasonNumber)));
         removed += before - show.seasons.length;
         return refreshShowCandidateFields(show);
-      }).filter(show => show.seasons.some(season => season.candidate));
+      }).filter(show => show.seasons.length > 0);
     }
   }
   renderScan();
@@ -1848,7 +2175,18 @@ async function deleteSelected() {
   const payload = selectedPayload();
   const movieCount = payload.movies.length;
   const showCount = payload.shows.length;
-  if (!confirm(`Delete ${movieCount} movie selection(s) and ${showCount} TV selection(s) through Radarr/Sonarr? Files will be deleted.`)) return;
+  const deleteMode = $("deleteMode").value || "arr_plex_disk";
+  const preview = deletePreview(payload);
+  const modeText = deleteMode === "arr_only"
+    ? "Only Radarr/Sonarr will be updated. Plex and disk files will stay in place."
+    : "Radarr/Sonarr will be updated and Plex/disk media will also be deleted.";
+  const previewText = preview.lines.length ? preview.lines.join("\n") : "- Nothing selected";
+  if (!confirm(
+    `Delete ${movieCount} movie selection(s) and ${showCount} TV selection(s)?\n\n` +
+    `${modeText}\n\n` +
+    `Total selected size: ${humanBytes(preview.totalSize)}\n\n` +
+    `${previewText}`
+  )) return;
   $("deleteBtn").disabled = true;
   $("scanStatus").textContent = "Deleting selected media...";
   try {
@@ -1864,7 +2202,8 @@ async function deleteSelected() {
 
 async function init() {
   try {
-    fillConfig(await api("/api/config"));
+    const config = await api("/api/config");
+    fillConfig(config);
     loadSavedLibrariesIfPossible();
     $("saveBtn").addEventListener("click", () => saveConfig().catch(err => showLog({ error: err.message })));
     $("testBtn").addEventListener("click", () => testConnections().catch(err => showLog({ error: err.message })));
@@ -1888,6 +2227,21 @@ async function init() {
     $("showSort").addEventListener("change", () => {
       state.ui.showSort = $("showSort").value;
       renderMediaLists();
+    });
+    $("movieFilter").addEventListener("change", () => {
+      state.ui.movieFilter = $("movieFilter").value;
+      renderScan();
+    });
+    $("showFilter").addEventListener("change", () => {
+      state.ui.showFilter = $("showFilter").value;
+      renderScan();
+    });
+    $("inactiveDays").addEventListener("change", () => {
+      if (state.scan) renderScan();
+    });
+    $("toggleSettingsBtn").addEventListener("click", () => {
+      state.ui.settingsCollapsed = !state.ui.settingsCollapsed;
+      applyListUiState();
     });
     $("toggleMoviesBtn").addEventListener("click", () => {
       state.ui.moviesCollapsed = !state.ui.moviesCollapsed;

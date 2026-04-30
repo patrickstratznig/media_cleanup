@@ -1,9 +1,8 @@
 # Plex Cleanup GUI
 
-A local browser GUI that scans Plex for movies and TV seasons that have never
-been watched, or have not been watched in a configured number of days. You can
-review candidates, see file sizes, select individual movies, whole shows, or TV
-seasons, then delete them through Radarr or Sonarr.
+A local browser GUI that scans Plex for all movies and TV shows in the selected
+libraries, shows last watched details, lets you filter by watch age, and then
+delete selected movies, whole shows, or TV seasons through Radarr or Sonarr.
 
 ## Run
 
@@ -30,10 +29,14 @@ The app writes `config.json` next to the script after you save settings.
 - Watch data controls whether inactivity is based on the Plex account tied to
   the token or Plex server playback history for any user on the server. `Any
   user on server` requires a Plex server admin token.
-- Inactive days controls the cutoff and defaults to 365 days. Anything never
-  watched or last watched before that cutoff appears as a candidate.
-- Movies and TV results can be sorted by title or size and collapsed while you
-  review candidates.
+- Delete target controls whether deletes only update Radarr or Sonarr, or also
+  remove the selected media from Plex and disk.
+- Inactive days controls the filter threshold and defaults to 365 days. You can
+  use it with the movie and TV filter controls to show everything, only never
+  watched items, items not watched in that many days, or items watched within
+  that many days.
+- Movies and TV results can be sorted by title or size, filtered by watch age,
+  and collapsed while you review the list.
 - In `Any user on server` mode, movie and season results can also show which
   user last watched the item when Plex history includes a resolvable account.
 
@@ -41,22 +44,23 @@ The app writes `config.json` next to the script after you save settings.
 
 - Movies are matched to Radarr by TMDB ID, IMDb ID, then title/year fallback.
 - Shows are matched to Sonarr by TVDB ID, IMDb ID, then title/year fallback.
-- Movie deletion removes the movie from Radarr when matched, and also deletes it
-  from Plex so the file is removed from disk and the item disappears from Plex.
-- Whole-show deletion removes the show from Sonarr when matched, and also
-  deletes it from Plex so the files are removed from disk and the item
-  disappears from Plex.
-- Season deletion deletes matching Sonarr episode files for the selected
-  season numbers. The app first unmonitors those seasons in Sonarr so they are
-  not downloaded again. It also deletes the selected season from Plex so the
-  files are removed from disk and the season disappears from Plex.
+- In `Radarr/Sonarr only` mode, movie deletes remove the item only from Radarr,
+  whole-show deletes remove the full series only from Sonarr, and season-only
+  deletes only unmonitor those seasons in Sonarr.
+- In `Radarr/Sonarr + Plex/disk` mode, movie deletes remove the movie from
+  Radarr when matched and also delete it from Plex and disk.
+- In `Radarr/Sonarr + Plex/disk` mode, whole-show deletes remove the full series
+  from Sonarr when matched and also delete it from Plex and disk.
+- In `Radarr/Sonarr + Plex/disk` mode, season-only deletes unmonitor the
+  selected seasons in Sonarr, delete matching Sonarr episode files, and also
+  delete the selected season from Plex and disk.
 - Sonarr does not remove individual season entries from a series. To make a TV
   item disappear from Sonarr entirely, delete the whole show.
-- If a movie or show is no longer present in Radarr or Sonarr, deletion falls
-  back to Plex-only deletion.
-- TV scans include the whole show when at least one season is inactive. All
-  seasons are shown, and you can still choose recent seasons or the whole show
-  for deletion from the review list.
+- If a movie or show is no longer present in Radarr or Sonarr, `Radarr/Sonarr +
+  Plex/disk` mode falls back to Plex-only deletion.
+- TV scans show every show that has episode files in the selected Plex library.
+  All seasons are shown, and you can choose recent seasons, old seasons, or the
+  whole show for deletion from the review list.
 - `Any user on server` mode uses Plex playback history for the selected library.
   That lets the scan see activity from shared users, but it requires a Plex
   server admin token with access to playback history.
