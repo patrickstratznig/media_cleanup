@@ -54,7 +54,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "inactive_days": 365,
         "include_never_watched": True,
         "include_watched_before_cutoff": True,
-        "watch_source": "account",
     },
     "delete": {
         "mode": "arr_plex_disk",
@@ -567,6 +566,10 @@ def plex_can_read_server_history(config: dict[str, Any], library_section_id: str
         return False, str(exc)
 
 
+def plex_server_capabilities(config: dict[str, Any]) -> dict[str, Any]:
+    return media_container(plex_get(config, "/"))
+
+
 def paged_metadata(
     config: dict[str, Any],
     path: str,
@@ -718,7 +721,6 @@ def build_show_seasons(
 
 def scan_media(config: dict[str, Any]) -> dict[str, Any]:
     inactive_days = int(config["scan"].get("inactive_days") or 365)
-    watch_source = str(config["scan"].get("watch_source") or "account")
     cutoff = int(time.time()) - inactive_days * 86400
     libraries = plex_libraries(config)
     movie_key = None
@@ -738,8 +740,8 @@ def scan_media(config: dict[str, Any]) -> dict[str, Any]:
     result: dict[str, Any] = {
         "generatedAt": int(time.time()),
         "inactiveDays": inactive_days,
-        "watchSource": watch_source,
-        "watchSourceLabel": "Any user on server" if watch_source == "all_users" else "This Plex account",
+        "watchSource": "account",
+        "watchSourceLabel": "This Plex account",
         "movies": [],
         "shows": [],
         "warnings": [],
@@ -749,19 +751,31 @@ def scan_media(config: dict[str, Any]) -> dict[str, Any]:
         result["warnings"].append("No Plex movie library selected.")
     if not show_key:
         result["warnings"].append("No Plex TV library selected.")
+    plex_caps = plex_server_capabilities(config)
+    allow_media_deletion = bool(plex_caps.get("allowMediaDeletion"))
+    result["allowMediaDeletion"] = allow_media_deletion
+    history_ok, history_error = plex_can_read_server_history(config, movie_key or show_key)
+    watch_source = "all_users" if history_ok else "account"
+    result["watchSource"] = watch_source
+    result["watchSourceLabel"] = "Any user on server" if watch_source == "all_users" else "This Plex account"
+    if watch_source == "all_users":
+        result["warnings"].append(
+            "Using Plex playback history to detect watches from any user on the server."
+        )
+    else:
+        result["warnings"].append(
+            "Plex token cannot read server-wide watch history, so only this account's watch data is being used."
+        )
+        if history_error:
+            result["warnings"].append(f"History access check failed: {history_error}")
+    if not allow_media_deletion:
+        result["warnings"].append(
+            "Plex media deletion is not allowed for this token/server. Plex/disk delete mode will fail until deletion rights are enabled."
+        )
     movie_history_last_viewed: dict[str, dict[str, Any]] = {}
     show_history_last_viewed: dict[str, dict[str, Any]] = {}
     if watch_source == "all_users":
-        history_ok, history_error = plex_can_read_server_history(config, movie_key or show_key)
-        if not history_ok:
-            raise ApiError(
-                "Watch data mode 'Any user on server' requires a Plex server admin token that can read playback history. "
-                f"Current token check failed: {history_error}"
-            )
         account_names = plex_account_names(config)
-        result["warnings"].append(
-            "Using Plex playback history to detect watches from any user on the server with an admin Plex token."
-        )
         if movie_key:
             movie_history_last_viewed = playback_history_latest_info(config, movie_key, account_names)
         if show_key:
@@ -1177,7 +1191,7 @@ def perform_delete(config: dict[str, Any], payload: dict[str, Any]) -> dict[str,
 def test_connections(config: dict[str, Any]) -> dict[str, Any]:
     checks = {}
     try:
-        account = media_container(plex_get(config, "/"))
+        account = plex_server_capabilities(config)
         history_ok, history_error = plex_can_read_server_history(config)
         checks["plex"] = {
             "ok": True,
@@ -1266,6 +1280,11 @@ INDEX_HTML = r"""<!doctype html>
       align-items: center;
       justify-content: space-between;
       gap: 12px;
+    }
+    .section-title-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
     }
     h2 { font-size: 16px; margin: 0; }
     .content { padding: 16px; }
@@ -1487,9 +1506,11 @@ INDEX_HTML = r"""<!doctype html>
   <main>
     <section>
       <div class="section-head">
-        <h2>Settings</h2>
-        <div class="actions">
+        <div class="section-title-row">
+          <h2>Settings</h2>
           <button id="toggleSettingsBtn">Collapse</button>
+        </div>
+        <div class="actions">
           <div class="status-stack">
             <span class="status-label">Status</span>
             <span id="connectionStatus" class="status">Not tested</span>
@@ -1500,12 +1521,11 @@ INDEX_HTML = r"""<!doctype html>
         <div class="connection-card">
           <div class="card-head">
             <div class="card-title">Plex</div>
-            <div class="card-subtitle">Server access, watch history mode, and the libraries we scan.</div>
+            <div class="card-subtitle">Server access and the libraries we scan.</div>
           </div>
           <div class="field-grid">
             <label class="field-span-2">Plex URL<input id="plexUrl" placeholder="http://server:32400"></label>
             <label class="field-span-2">Plex admin token<input id="plexToken" type="password"><a class="help-link" href="https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token/" target="_blank" rel="noreferrer">How to find your Plex token</a><span class="help-text">Click <b>Test</b> to check for admin rights.</span></label>
-            <label>Watch data<select id="watchSource"><option value="account">This Plex account</option><option value="all_users">Any user on server</option></select></label>
             <label>Filter days<input id="inactiveDays" type="number" min="1"></label>
             <label>Movie library<select id="movieLibrary"><option value="">Load Plex libraries</option></select></label>
             <label>TV library<select id="showLibrary"><option value="">Load Plex libraries</option></select></label>
@@ -1547,12 +1567,14 @@ INDEX_HTML = r"""<!doctype html>
     </section>
     <section>
       <div class="section-head">
-        <h2>Movies</h2>
+        <div class="section-title-row">
+          <h2>Movies</h2>
+          <button id="toggleMoviesBtn">Collapse</button>
+        </div>
         <div class="actions">
           <span id="movieCount" class="status">0</span>
           <label class="inline-field">Sort<select id="movieSort"><option value="title_asc">A-Z</option><option value="title_desc">Z-A</option><option value="size_desc">Largest</option><option value="size_asc">Smallest</option></select></label>
           <label class="inline-field">Filter<select id="movieFilter"><option value="all">All</option><option value="never">Never watched</option><option value="older">Not watched in set days</option><option value="recent">Watched in set days</option></select></label>
-          <button id="toggleMoviesBtn">Collapse</button>
           <button id="selectAllMoviesBtn">Select all</button>
           <button id="clearMoviesBtn">Clear</button>
         </div>
@@ -1561,12 +1583,14 @@ INDEX_HTML = r"""<!doctype html>
     </section>
     <section>
       <div class="section-head">
-        <h2>TV Shows</h2>
+        <div class="section-title-row">
+          <h2>TV Shows</h2>
+          <button id="toggleShowsBtn">Collapse</button>
+        </div>
         <div class="actions">
           <span id="showCount" class="status">0</span>
           <label class="inline-field">Sort<select id="showSort"><option value="title_asc">A-Z</option><option value="title_desc">Z-A</option><option value="size_desc">Largest</option><option value="size_asc">Smallest</option></select></label>
           <label class="inline-field">Filter<select id="showFilter"><option value="all">All</option><option value="never">Never watched</option><option value="older">Not watched in set days</option><option value="recent">Watched in set days</option></select></label>
-          <button id="toggleShowsBtn">Collapse</button>
           <button id="selectAllShowsBtn">Select all</button>
           <button id="clearShowsBtn">Clear</button>
         </div>
@@ -1842,7 +1866,6 @@ function readConfig() {
       inactive_days: Number($("inactiveDays").value || 365),
       include_never_watched: true,
       include_watched_before_cutoff: true,
-      watch_source: $("watchSource").value || "account",
     },
   };
 }
@@ -1861,7 +1884,6 @@ function fillConfig(config) {
   setLibraryPending($("movieLibrary"), config.plex.movie_library || "");
   setLibraryPending($("showLibrary"), config.plex.show_library || "");
   $("inactiveDays").value = config.scan.inactive_days || 365;
-  $("watchSource").value = config.scan.watch_source || "account";
   $("radarrUrl").value = config.radarr.url || "";
   $("radarrKey").value = config.radarr.api_key || "";
   $("sonarrUrl").value = config.sonarr.url || "";

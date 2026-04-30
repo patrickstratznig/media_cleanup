@@ -26,9 +26,9 @@ The app writes `config.json` next to the script after you save settings.
 - Use `Load libraries` in the GUI to fetch Plex movie and TV libraries, then
   select exactly which movie library and TV library to scan. Leaving a library
   unselected skips that media type.
-- Watch data controls whether inactivity is based on the Plex account tied to
-  the token or Plex server playback history for any user on the server. `Any
-  user on server` requires a Plex server admin token.
+- Watch data is automatic. If the Plex token can read server playback history,
+  the scan uses watch data from any user on the server. Otherwise it falls back
+  to the watch data for the token's own Plex account and shows a warning.
 - Delete target controls whether deletes only update Radarr or Sonarr, or also
   remove the selected media from Plex and disk.
 - Inactive days controls the filter threshold and defaults to 365 days. You can
@@ -37,8 +37,9 @@ The app writes `config.json` next to the script after you save settings.
   that many days.
 - Movies and TV results can be sorted by title or size, filtered by watch age,
   and collapsed while you review the list.
-- In `Any user on server` mode, movie and season results can also show which
-  user last watched the item when Plex history includes a resolvable account.
+- When server playback history is available, movie and season results can also
+  show which user last watched the item when Plex history includes a resolvable
+  account.
 
 ## Deletion Behavior
 
@@ -61,9 +62,12 @@ The app writes `config.json` next to the script after you save settings.
 - TV scans show every show that has episode files in the selected Plex library.
   All seasons are shown, and you can choose recent seasons, old seasons, or the
   whole show for deletion from the review list.
-- `Any user on server` mode uses Plex playback history for the selected library.
-  That lets the scan see activity from shared users, but it requires a Plex
-  server admin token with access to playback history.
+- When the Plex token can read server playback history, the scan uses that data
+  for the selected libraries so it can see activity from shared users.
+- When the Plex token cannot read server playback history, the scan falls back
+  to the token's own account watch data and shows a warning in the UI.
+- If the Plex token does not have media deletion rights, the UI shows a warning
+  that Plex/disk delete mode will fail until deletion is allowed.
 - Nothing is deleted during scan. Deletion only happens after selecting rows and
   confirming in the browser.
 
