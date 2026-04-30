@@ -27,8 +27,12 @@ The app writes `config.json` next to the script after you save settings.
 - Use `Load libraries` in the GUI to fetch Plex movie and TV libraries, then
   select exactly which movie library and TV library to scan. Leaving a library
   unselected skips that media type.
+- Watch data controls whether inactivity is based on the Plex account tied to
+  the token or Plex server playback history for any user on the server.
 - Inactive days controls the cutoff and defaults to 365 days. Anything never
   watched or last watched before that cutoff appears as a candidate.
+- Movies and TV results can be sorted by title or size, collapsed, and switched
+  to a compact view while you review candidates.
 
 ## Deletion Behavior
 
@@ -44,8 +48,11 @@ The app writes `config.json` next to the script after you save settings.
 - Sonarr does not remove individual season entries from a series. To make a TV
   item disappear from Sonarr entirely, delete the whole show.
 - TV scans include the whole show when at least one season is inactive. All
-  seasons are shown, but recently watched seasons are visible only and cannot be
-  selected for deletion.
+  seasons are shown, and you can still choose recent seasons or the whole show
+  for deletion from the review list.
+- `Any user on server` mode uses Plex playback history for the selected library.
+  That lets the scan see activity from shared users, but it depends on the Plex
+  token being allowed to read admin playback history.
 - Nothing is deleted during scan. Deletion only happens after selecting rows and
   confirming in the browser.
 

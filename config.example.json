@@ -18,6 +18,7 @@
   "scan": {
     "inactive_days": 365,
     "include_never_watched": true,
-    "include_watched_before_cutoff": true
+    "include_watched_before_cutoff": true,
+    "watch_source": "account"
   }
 }

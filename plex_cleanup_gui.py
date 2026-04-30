@@ -52,6 +52,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "inactive_days": 365,
         "include_never_watched": True,
         "include_watched_before_cutoff": True,
+        "watch_source": "account",
     },
 }
 
@@ -136,13 +137,25 @@ def request_json(
 
 
 def plex_get(config: dict[str, Any], path: str, params: dict[str, Any] | None = None) -> Any:
+    return plex_get_with_headers(config, path, params=params)
+
+
+def plex_get_with_headers(
+    config: dict[str, Any],
+    path: str,
+    params: dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
+) -> Any:
     plex = config["plex"]
     service = Service(normalize_url(plex["url"]), token=plex["token"].strip())
     query = {"X-Plex-Token": service.token}
     if params:
         query.update({k: v for k, v in params.items() if v not in (None, "")})
     url = service.endpoint(path) + "?" + urllib.parse.urlencode(query)
-    return request_json("GET", url, headers={"Accept": "application/json"})
+    final_headers = {"Accept": "application/json"}
+    if headers:
+        final_headers.update(headers)
+    return request_json("GET", url, headers=final_headers)
 
 
 def arr_get(service: Service, path: str, params: dict[str, Any] | None = None) -> Any:
@@ -241,14 +254,107 @@ def latest_timestamp(values: list[int | None]) -> int | None:
     return max(timestamps) if timestamps else None
 
 
-def watched_state(item: dict[str, Any], cutoff: int) -> dict[str, Any]:
+def parse_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def account_last_viewed(item: dict[str, Any]) -> int | None:
     view_count = int(item.get("viewCount") or 0)
-    last_viewed = int(item.get("lastViewedAt") or 0)
+    last_viewed = parse_int(item.get("lastViewedAt"))
     if not view_count or not last_viewed:
-        return {"candidate": True, "reason": "Never watched", "lastViewedAt": None}
+        return None
+    return last_viewed
+
+
+def watched_state_for_last_viewed(
+    last_viewed: int | None,
+    cutoff: int,
+    never_reason: str,
+    old_reason: str,
+    recent_reason: str,
+) -> dict[str, Any]:
+    if not last_viewed:
+        return {"candidate": True, "reason": never_reason, "lastViewedAt": None}
     if last_viewed < cutoff:
-        return {"candidate": True, "reason": "Not watched recently", "lastViewedAt": last_viewed}
-    return {"candidate": False, "reason": "Watched recently", "lastViewedAt": last_viewed}
+        return {"candidate": True, "reason": old_reason, "lastViewedAt": last_viewed}
+    return {"candidate": False, "reason": recent_reason, "lastViewedAt": last_viewed}
+
+
+def watched_state(
+    item: dict[str, Any],
+    cutoff: int,
+    watch_source: str = "account",
+    history_last_viewed: int | None = None,
+) -> dict[str, Any]:
+    account_viewed = account_last_viewed(item)
+    if watch_source == "all_users":
+        last_viewed = latest_timestamp([account_viewed, history_last_viewed])
+        return watched_state_for_last_viewed(
+            last_viewed,
+            cutoff,
+            "Never watched by any user",
+            "Not watched recently by any user",
+            "Watched recently by any user",
+        )
+    return watched_state_for_last_viewed(
+        account_viewed,
+        cutoff,
+        "Never watched",
+        "Not watched recently",
+        "Watched recently",
+    )
+
+
+def playback_history_items(data: Any) -> list[dict[str, Any]]:
+    metadata = metadata_list(data)
+    if metadata:
+        return metadata
+    items: list[dict[str, Any]] = []
+    for value in media_container(data).values():
+        if not isinstance(value, list):
+            continue
+        for item in value:
+            if isinstance(item, dict) and item.get("ratingKey") and item.get("viewedAt"):
+                items.append(item)
+    return items
+
+
+def playback_history_last_viewed(config: dict[str, Any], library_section_id: str) -> dict[str, int]:
+    latest_by_rating_key: dict[str, int] = {}
+    offset = 0
+    page_size = 1000
+    params = {"librarySectionID": library_section_id, "sort": "viewedAt:desc"}
+    while True:
+        data = plex_get_with_headers(
+            config,
+            "/status/sessions/history/all",
+            params=params,
+            headers={
+                "X-Plex-Container-Start": str(offset),
+                "X-Plex-Container-Size": str(page_size),
+            },
+        )
+        container = media_container(data)
+        items = playback_history_items(data)
+        for item in items:
+            rating_key = str(item.get("ratingKey") or "")
+            viewed_at = parse_int(item.get("viewedAt"))
+            if rating_key and viewed_at:
+                latest_by_rating_key[rating_key] = max(latest_by_rating_key.get(rating_key, 0), viewed_at)
+        current_offset = parse_int(container.get("offset")) or offset
+        total_size = parse_int(container.get("totalSize")) or 0
+        if not items:
+            break
+        next_offset = current_offset + len(items)
+        if total_size and next_offset >= total_size:
+            break
+        if next_offset <= offset:
+            break
+        offset = next_offset
+    return latest_by_rating_key
 
 
 def plex_libraries(config: dict[str, Any]) -> list[dict[str, str]]:
@@ -284,9 +390,16 @@ def get_movie_detail(config: dict[str, Any], rating_key: str) -> dict[str, Any]:
     return first_metadata(plex_get(config, f"/library/metadata/{rating_key}"))
 
 
-def get_show_seasons(config: dict[str, Any], rating_key: str, cutoff: int) -> tuple[list[dict[str, Any]], int]:
+def get_show_seasons(
+    config: dict[str, Any],
+    rating_key: str,
+    cutoff: int,
+    watch_source: str = "account",
+    history_last_viewed: dict[str, int] | None = None,
+) -> tuple[list[dict[str, Any]], int]:
     seasons = []
     skipped_episodes = 0
+    history_last_viewed = history_last_viewed or {}
     for season in metadata_list(plex_get(config, f"/library/metadata/{rating_key}/children")):
         if season.get("type") != "season":
             continue
@@ -301,14 +414,20 @@ def get_show_seasons(config: dict[str, Any], rating_key: str, cutoff: int) -> tu
             if not item_has_file(detail):
                 skipped_episodes += 1
                 continue
-            state = watched_state(detail, cutoff)
+            item_rating_key = str(detail.get("ratingKey") or episode.get("ratingKey") or "")
+            state = watched_state(
+                detail,
+                cutoff,
+                watch_source=watch_source,
+                history_last_viewed=history_last_viewed.get(item_rating_key),
+            )
             size = item_size(detail)
             total_size += size
             if state["lastViewedAt"]:
                 watched_episodes += 1
             episodes.append(
                 {
-                    "ratingKey": str(detail.get("ratingKey") or episode.get("ratingKey")),
+                    "ratingKey": item_rating_key,
                     "title": detail.get("title") or episode.get("title") or "Episode",
                     "index": detail.get("index") or episode.get("index"),
                     "lastViewedAt": state["lastViewedAt"],
@@ -343,12 +462,15 @@ def get_show_seasons(config: dict[str, Any], rating_key: str, cutoff: int) -> tu
 
 def scan_media(config: dict[str, Any]) -> dict[str, Any]:
     inactive_days = int(config["scan"].get("inactive_days") or 365)
+    watch_source = str(config["scan"].get("watch_source") or "account")
     cutoff = int(time.time()) - inactive_days * 86400
     movie_key = find_library_key(config, "movie", config["plex"].get("movie_library", ""))
     show_key = find_library_key(config, "show", config["plex"].get("show_library", ""))
     result: dict[str, Any] = {
         "generatedAt": int(time.time()),
         "inactiveDays": inactive_days,
+        "watchSource": watch_source,
+        "watchSourceLabel": "Any user on server" if watch_source == "all_users" else "This Plex account",
         "movies": [],
         "shows": [],
         "warnings": [],
@@ -358,6 +480,16 @@ def scan_media(config: dict[str, Any]) -> dict[str, Any]:
         result["warnings"].append("No Plex movie library selected.")
     if not show_key:
         result["warnings"].append("No Plex TV library selected.")
+    movie_history_last_viewed: dict[str, int] = {}
+    show_history_last_viewed: dict[str, int] = {}
+    if watch_source == "all_users":
+        result["warnings"].append(
+            "Using Plex playback history to detect watches from any user on the server. This requires a Plex token that can read admin history."
+        )
+        if movie_key:
+            movie_history_last_viewed = playback_history_last_viewed(config, movie_key)
+        if show_key:
+            show_history_last_viewed = playback_history_last_viewed(config, show_key)
 
     if movie_key:
         for movie in metadata_list(plex_get(config, f"/library/sections/{movie_key}/all", {"type": 1})):
@@ -367,7 +499,13 @@ def scan_media(config: dict[str, Any]) -> dict[str, Any]:
             if not item_has_file(detail):
                 result["skippedNoFile"]["movies"] += 1
                 continue
-            state = watched_state(detail, cutoff)
+            item_rating_key = str(detail.get("ratingKey") or movie.get("ratingKey") or "")
+            state = watched_state(
+                detail,
+                cutoff,
+                watch_source=watch_source,
+                history_last_viewed=movie_history_last_viewed.get(item_rating_key),
+            )
             if not state["candidate"]:
                 continue
             size = item_size(detail)
@@ -375,7 +513,7 @@ def scan_media(config: dict[str, Any]) -> dict[str, Any]:
             result["movies"].append(
                 {
                     "kind": "movie",
-                    "ratingKey": str(detail.get("ratingKey") or movie.get("ratingKey")),
+                    "ratingKey": item_rating_key,
                     "title": detail.get("title") or movie.get("title") or "Movie",
                     "year": detail.get("year"),
                     "lastViewedAt": state["lastViewedAt"],
@@ -390,7 +528,13 @@ def scan_media(config: dict[str, Any]) -> dict[str, Any]:
         for show in metadata_list(plex_get(config, f"/library/sections/{show_key}/all", {"type": 2})):
             detail = first_metadata(plex_get(config, f"/library/metadata/{show.get('ratingKey')}")) or show
             ids = extract_guid_ids(detail)
-            all_seasons, skipped_episodes = get_show_seasons(config, str(show.get("ratingKey")), cutoff)
+            all_seasons, skipped_episodes = get_show_seasons(
+                config,
+                str(show.get("ratingKey")),
+                cutoff,
+                watch_source=watch_source,
+                history_last_viewed=show_history_last_viewed,
+            )
             result["skippedNoFile"]["episodes"] += skipped_episodes
             candidate_seasons = [season for season in all_seasons if season["candidate"]]
             if not candidate_seasons:
@@ -688,6 +832,18 @@ INDEX_HTML = r"""<!doctype html>
       gap: 12px;
     }
     label { display: grid; gap: 5px; color: var(--muted); font-size: 12px; font-weight: 650; }
+    .inline-field {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 650;
+    }
+    .inline-field select {
+      min-width: 150px;
+      width: auto;
+    }
     input, select {
       min-width: 0;
       height: 38px;
@@ -744,6 +900,17 @@ INDEX_HTML = r"""<!doctype html>
     .metric b { display: block; font-size: 22px; }
     .metric span { color: var(--muted); font-size: 12px; }
     .list { display: grid; gap: 10px; }
+    .list.compact { gap: 6px; }
+    .list.compact .row {
+      gap: 8px;
+      padding: 8px 10px;
+    }
+    .list.compact .season {
+      gap: 8px;
+      padding: 8px 10px 8px 34px;
+    }
+    .list.compact details.seasons summary { padding: 8px 10px; }
+    .list.compact .sub { font-size: 12px; }
     .item {
       border: 1px solid var(--line);
       border-radius: 8px;
@@ -816,6 +983,7 @@ INDEX_HTML = r"""<!doctype html>
         <label>Plex URL<input id="plexUrl" placeholder="http://server:32400"></label>
         <label>Plex token<input id="plexToken" type="password"></label>
         <label>Inactive days<input id="inactiveDays" type="number" min="1"></label>
+        <label>Watch data<select id="watchSource"><option value="account">This Plex account</option><option value="all_users">Any user on server</option></select></label>
         <label>Movie library<select id="movieLibrary"><option value="">Load Plex libraries</option></select></label>
         <label>TV library<select id="showLibrary"><option value="">Load Plex libraries</option></select></label>
         <label class="check-label"><input id="addImportExclusion" type="checkbox" checked disabled> Prevent Radarr re-downloads</label>
@@ -841,6 +1009,9 @@ INDEX_HTML = r"""<!doctype html>
         <h2>Movies</h2>
         <div class="actions">
           <span id="movieCount" class="status">0</span>
+          <label class="inline-field">Sort<select id="movieSort"><option value="title_asc">A-Z</option><option value="title_desc">Z-A</option><option value="size_desc">Largest</option><option value="size_asc">Smallest</option></select></label>
+          <button id="movieCompactBtn">Compact</button>
+          <button id="toggleMoviesBtn">Collapse</button>
           <button id="selectAllMoviesBtn">Select all</button>
           <button id="clearMoviesBtn">Clear</button>
         </div>
@@ -852,6 +1023,9 @@ INDEX_HTML = r"""<!doctype html>
         <h2>TV Shows</h2>
         <div class="actions">
           <span id="showCount" class="status">0</span>
+          <label class="inline-field">Sort<select id="showSort"><option value="title_asc">A-Z</option><option value="title_desc">Z-A</option><option value="size_desc">Largest</option><option value="size_asc">Smallest</option></select></label>
+          <button id="showCompactBtn">Compact</button>
+          <button id="toggleShowsBtn">Collapse</button>
           <button id="selectAllShowsBtn">Select all</button>
           <button id="clearShowsBtn">Clear</button>
         </div>
@@ -864,7 +1038,18 @@ INDEX_HTML = r"""<!doctype html>
     </section>
   </main>
 <script>
-const state = { config: null, scan: null };
+const state = {
+  config: null,
+  scan: null,
+  ui: {
+    movieSort: "title_asc",
+    showSort: "title_asc",
+    moviesCompact: false,
+    showsCompact: false,
+    moviesCollapsed: false,
+    showsCollapsed: false,
+  },
+};
 const $ = (id) => document.getElementById(id);
 
 function selectedValueOrText(select) {
@@ -874,6 +1059,88 @@ function selectedValueOrText(select) {
 function formatDate(ts) {
   if (!ts) return "never";
   return new Date(ts * 1000).toLocaleDateString();
+}
+
+function compareText(left, right) {
+  return String(left || "").localeCompare(String(right || ""), undefined, { numeric: true, sensitivity: "base" });
+}
+
+function sortItems(items, sortMode) {
+  return [...items].sort((left, right) => {
+    if (sortMode === "size_desc") {
+      return Number(right.size || 0) - Number(left.size || 0) || compareText(left.title, right.title);
+    }
+    if (sortMode === "size_asc") {
+      return Number(left.size || 0) - Number(right.size || 0) || compareText(left.title, right.title);
+    }
+    if (sortMode === "title_desc") {
+      return compareText(right.title, left.title);
+    }
+    return compareText(left.title, right.title);
+  });
+}
+
+function selectionSnapshot() {
+  return {
+    movies: new Set([...document.querySelectorAll(".movie-select:checked")].map(el => el.value)),
+    shows: new Set([...document.querySelectorAll(".show-select:checked")].map(el => el.value)),
+    seasons: new Set([...document.querySelectorAll(".season-select:checked")].map(el => `${el.dataset.show}:${el.value}`)),
+  };
+}
+
+function restoreSelection(snapshot) {
+  document.querySelectorAll(".movie-select").forEach(el => {
+    el.checked = snapshot.movies.has(el.value);
+  });
+  document.querySelectorAll(".show-select").forEach(el => {
+    el.checked = snapshot.shows.has(el.value);
+  });
+  document.querySelectorAll(".season-select").forEach(el => {
+    el.checked = snapshot.seasons.has(`${el.dataset.show}:${el.value}`);
+  });
+}
+
+function syncShowSeasonDisabledStates() {
+  document.querySelectorAll(".show-select").forEach(el => {
+    document.querySelectorAll(`.season-select[data-show="${el.value}"]`).forEach(season => {
+      season.disabled = el.checked;
+      if (el.checked) season.checked = false;
+    });
+  });
+}
+
+function applyListUiState() {
+  $("movieSort").value = state.ui.movieSort;
+  $("showSort").value = state.ui.showSort;
+  $("movies").classList.toggle("compact", state.ui.moviesCompact);
+  $("shows").classList.toggle("compact", state.ui.showsCompact);
+  $("movies").classList.toggle("hidden", state.ui.moviesCollapsed);
+  $("shows").classList.toggle("hidden", state.ui.showsCollapsed);
+  $("movieCompactBtn").textContent = state.ui.moviesCompact ? "Comfortable" : "Compact";
+  $("showCompactBtn").textContent = state.ui.showsCompact ? "Comfortable" : "Compact";
+  $("toggleMoviesBtn").textContent = state.ui.moviesCollapsed ? "Expand" : "Collapse";
+  $("toggleShowsBtn").textContent = state.ui.showsCollapsed ? "Expand" : "Collapse";
+}
+
+function bindSelectionListeners() {
+  document.querySelectorAll(".movie-select, .show-select, .season-select").forEach(el => el.addEventListener("change", updateDeleteButton));
+  document.querySelectorAll(".show-select").forEach(el => el.addEventListener("change", () => {
+    syncShowSeasonDisabledStates();
+    updateDeleteButton();
+  }));
+}
+
+function renderMediaLists() {
+  const snapshot = selectionSnapshot();
+  const movies = sortItems(state.scan?.movies || [], state.ui.movieSort);
+  const shows = sortItems(state.scan?.shows || [], state.ui.showSort);
+  $("movies").innerHTML = movies.length ? movies.map(renderMovie).join("") : `<div class="status">No movie candidates.</div>`;
+  $("shows").innerHTML = shows.length ? shows.map(renderShow).join("") : `<div class="status">No show candidates.</div>`;
+  bindSelectionListeners();
+  restoreSelection(snapshot);
+  syncShowSeasonDisabledStates();
+  applyListUiState();
+  updateDeleteButton();
 }
 
 function selectedPayload() {
@@ -904,7 +1171,6 @@ function setMovieSelection(checked) {
 
 function setShowSelection(checked) {
   document.querySelectorAll(".show-select").forEach(el => {
-    if (el.disabled) return;
     el.checked = checked;
     document.querySelectorAll(`.season-select[data-show="${el.value}"]`).forEach(season => {
       season.disabled = checked;
@@ -912,7 +1178,8 @@ function setShowSelection(checked) {
     });
   });
   document.querySelectorAll(".season-select").forEach(el => {
-    if (!el.disabled) el.checked = checked;
+    if (checked && el.disabled) return;
+    el.checked = checked;
   });
   updateDeleteButton();
 }
@@ -938,6 +1205,7 @@ function readConfig() {
       inactive_days: Number($("inactiveDays").value || 365),
       include_never_watched: true,
       include_watched_before_cutoff: true,
+      watch_source: $("watchSource").value || "account",
     },
   };
 }
@@ -956,6 +1224,7 @@ function fillConfig(config) {
   setLibraryPending($("movieLibrary"), config.plex.movie_library || "");
   setLibraryPending($("showLibrary"), config.plex.show_library || "");
   $("inactiveDays").value = config.scan.inactive_days || 365;
+  $("watchSource").value = config.scan.watch_source || "account";
   $("radarrUrl").value = config.radarr.url || "";
   $("radarrKey").value = config.radarr.api_key || "";
   $("addImportExclusion").checked = true;
@@ -1076,18 +1345,8 @@ function renderScan() {
   $("warnings").textContent = (state.scan.warnings || []).join(" ");
   $("movieCount").textContent = String(state.scan.movies.length);
   $("showCount").textContent = String(state.scan.shows.length);
-  $("movies").innerHTML = state.scan.movies.length ? state.scan.movies.map(renderMovie).join("") : `<div class="status">No movie candidates.</div>`;
-  $("shows").innerHTML = state.scan.shows.length ? state.scan.shows.map(renderShow).join("") : `<div class="status">No show candidates.</div>`;
   renderSkippedNoFile();
-  document.querySelectorAll("input[type=checkbox]").forEach(el => el.addEventListener("change", updateDeleteButton));
-  document.querySelectorAll(".show-select").forEach(el => el.addEventListener("change", () => {
-    document.querySelectorAll(`.season-select[data-show="${el.value}"]`).forEach(season => {
-      season.disabled = el.checked;
-      if (el.checked) season.checked = false;
-    });
-    updateDeleteButton();
-  }));
-  updateDeleteButton();
+  renderMediaLists();
 }
 
 function renderSkippedNoFile() {
@@ -1112,13 +1371,10 @@ function renderMovie(movie) {
 
 function renderShow(show) {
   const year = show.year ? ` (${show.year})` : "";
-  const wholeDisabled = show.canDeleteWholeShow ? "" : "disabled";
-  const wholeHelp = show.canDeleteWholeShow
-    ? "Whole show delete removes it from Sonarr"
-    : "Season delete removes files and unmonitors seasons; Sonarr keeps the show";
+  const wholeHelp = "Whole show delete removes it from Sonarr; selecting it clears season selections";
   return `<div class="item">
     <div class="row">
-      <input class="show-select" type="checkbox" value="${show.ratingKey}" ${wholeDisabled} title="${escapeHtml(wholeHelp)}">
+      <input class="show-select" type="checkbox" value="${show.ratingKey}" title="${escapeHtml(wholeHelp)}">
       <div><div class="title">${escapeHtml(show.title)}${year}</div><div class="sub">${wholeHelp}; latest watched ${formatDate(show.lastViewedAt)}</div></div>
       <span class="pill">${show.sizeText} inactive</span>
       <span class="sub">${idsText(show.ids)}</span>
@@ -1126,7 +1382,7 @@ function renderShow(show) {
     <details class="seasons" open>
       <summary>${show.seasons.length} season${show.seasons.length === 1 ? "" : "s"}</summary>
       ${show.seasons.map(season => `<div class="season">
-        <input class="season-select" data-show="${show.ratingKey}" type="checkbox" value="${season.seasonNumber}" ${season.candidate ? "" : "disabled"}>
+        <input class="season-select" data-show="${show.ratingKey}" type="checkbox" value="${season.seasonNumber}">
         <div><div class="title">${escapeHtml(season.title)}</div><div class="sub">${season.reason}; ${season.watchedEpisodeCount}/${season.episodeCount} episodes watched; latest watched ${formatDate(season.lastViewedAt)}</div></div>
         <span class="pill ${season.candidate ? "danger" : "ok"}">${season.sizeText}</span>
       </div>`).join("")}
@@ -1234,6 +1490,31 @@ async function init() {
     $("clearMoviesBtn").addEventListener("click", () => setMovieSelection(false));
     $("selectAllShowsBtn").addEventListener("click", () => setShowSelection(true));
     $("clearShowsBtn").addEventListener("click", () => setShowSelection(false));
+    $("movieSort").addEventListener("change", () => {
+      state.ui.movieSort = $("movieSort").value;
+      renderMediaLists();
+    });
+    $("showSort").addEventListener("change", () => {
+      state.ui.showSort = $("showSort").value;
+      renderMediaLists();
+    });
+    $("movieCompactBtn").addEventListener("click", () => {
+      state.ui.moviesCompact = !state.ui.moviesCompact;
+      applyListUiState();
+    });
+    $("showCompactBtn").addEventListener("click", () => {
+      state.ui.showsCompact = !state.ui.showsCompact;
+      applyListUiState();
+    });
+    $("toggleMoviesBtn").addEventListener("click", () => {
+      state.ui.moviesCollapsed = !state.ui.moviesCollapsed;
+      applyListUiState();
+    });
+    $("toggleShowsBtn").addEventListener("click", () => {
+      state.ui.showsCollapsed = !state.ui.showsCollapsed;
+      applyListUiState();
+    });
+    applyListUiState();
   } catch (err) {
     showLog({ error: err.message });
   }
